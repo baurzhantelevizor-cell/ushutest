@@ -786,7 +786,6 @@ async def on_ready():
     print(f"[BOT] {bot.user} запущен и готов к работе!")
 
 
-@bot.event
 # ═══════════════════════ AUTO WIN DECISION VIEW ═══════════════════════
 class AutoWinPollView(discord.ui.View):
     """Интерактивные кнопки выбора победителя после возвращения игроков."""
