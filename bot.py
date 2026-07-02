@@ -1121,21 +1121,47 @@ async def cmd_start_test(interaction: discord.Interaction):
 # ───────────── /random ────────────────
 @bot.tree.command(
     name="random",
-    description="Случайное число от 1 до указанного максимума (по дефолту 100)"
+    description="Выбрать случайного героя (можно указать роль)"
 )
-@app_commands.describe(max_val="Максимальное значение для генерации (по умолчанию 100)")
-async def cmd_random(interaction: discord.Interaction, max_val: int = 100):
-    if max_val < 1:
+@app_commands.describe(role="Роль: gold, exp, mid, jungle, roam")
+@app_commands.choices(role=[
+    app_commands.Choice(name="🪙 Gold (Стрелок)", value="gold"),
+    app_commands.Choice(name="🛡️ Exp (Боец)", value="exp"),
+    app_commands.Choice(name="🔮 Mid (Маг)", value="mid"),
+    app_commands.Choice(name="⚔️ Jungle (Лесник/Убийца)", value="jungle"),
+    app_commands.Choice(name="👣 Roam (Танк/Поддержка)", value="roam")
+])
+async def cmd_random(interaction: discord.Interaction, role: app_commands.Choice[str] = None):
+    heroes = load_heroes()
+    
+    if role:
+        role_val = role.value
+        role_heroes = [h for h in heroes if HERO_ROLES.get(h, "exp") == role_val]
+        if not role_heroes:
+            await interaction.response.send_message(
+                f"❌ Героев для роли {role.name} не найдено.",
+                ephemeral=True
+            )
+            return
+        chosen_hero = random.choice(role_heroes)
+        role_label = role.name
         await interaction.response.send_message(
-            "❌ Максимальное значение должно быть не меньше 1.",
-            ephemeral=True
+            f"🎲 {interaction.user.mention} крутит рандомайзер на роль **{role_label}** и выбивает: **{chosen_hero}**!"
         )
-        return
-        
-    rolled_num = random.randint(1, max_val)
-    await interaction.response.send_message(
-        f"🎲 {interaction.user.mention} крутит рандомайзер (1-{max_val}) и выбивает: **{rolled_num}**"
-    )
+    else:
+        chosen_hero = random.choice(heroes)
+        detected_role = HERO_ROLES.get(chosen_hero, "exp")
+        role_labels = {
+            "gold": "🪙 Gold",
+            "exp": "🛡️ Exp",
+            "mid": "🔮 Mid",
+            "jungle": "⚔️ Jungle",
+            "roam": "👣 Roam"
+        }
+        role_text = role_labels.get(detected_role, detected_role.capitalize())
+        await interaction.response.send_message(
+            f"🎲 {interaction.user.mention} крутит рандомайзер и выбивает случайного героя: **{chosen_hero}** ({role_text})!"
+        )
 
 
 # ═══════════════════════════ RUN ═════════════════════════════════
