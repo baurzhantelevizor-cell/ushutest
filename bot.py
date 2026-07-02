@@ -621,7 +621,13 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
     team_a_full = []
     team_b_full = []
 
-    if lobby.match_type in ("ranked", "classic"):
+    if lobby.match_type == "ranked":
+        # В Ranked режиме НЕТ раздачи героев и лайнов. Просто сохраняем игроков в команды.
+        for member, elo in team_a:
+            team_a_full.append((member, elo, "Свои герои", "Любая"))
+        for member, elo in team_b:
+            team_b_full.append((member, elo, "Свои герои", "Любая"))
+    elif lobby.match_type == "classic":
         role_picks = pick_unique_heroes_by_roles(heroes)
         role_to_heroes = {r: [] for r in roles_order}
         for h_name, role in role_picks:
@@ -637,6 +643,7 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
             hero = role_to_heroes[role][1]
             team_b_full.append((member, elo, hero, role))
     else:
+        # Chaos
         picked_heroes = pick_unique_heroes(heroes, 10)
         random.shuffle(picked_heroes)
         
@@ -726,21 +733,34 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
     def build_embed_team_section(team_full_list: list) -> str:
         sec_lines = []
         for idx, (m, elo, hero, role) in enumerate(team_full_list, start=1):
-            role_label = role_emojis.get(role, role.capitalize())
-            sec_lines.append(f"`{idx}.` {m.mention}\n    {role_label} · 🦸 : **{hero}**")
+            if lobby.match_type == "ranked":
+                sec_lines.append(f"`{idx}.` {m.mention} — 🎖️ {elo} ЭЛО")
+            else:
+                role_label = role_emojis.get(role, role.capitalize())
+                sec_lines.append(f"`{idx}.` {m.mention}\n    {role_label} · 🦸 : **{hero}**")
         return "\n".join(sec_lines)
 
-    result_embed = discord.Embed(
-        title=match_title,
-        description=(
+    if lobby.match_type == "ranked":
+        desc = (
+            f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Игроки распределены на две сбалансированные команды. Удачи в игре! 🎮\n"
+            f"{move_notes}\n\n"
+            "**После игры администратор может выбрать победителя с помощью `/win_team`**"
+        )
+    else:
+        desc = (
             f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "Герои распределены по ролям. Удачи на поле боя! 🎮\n"
             "Если у вас нет выпавшего героя, нажмите кнопку **Реролл 🎲** ниже"
             f"{move_notes}\n\n"
-            "**После игры администратор может выбрать победителя с помощью `/win_team`**" if lobby.match_type == "ranked"
-            else f"Герои распределены. Удачи на поле боя! 🎮\nЕсли у вас нет выпавшего героя, нажмите кнопку **Реролл 🎲** ниже{move_notes}\n\n*(Этот матч не влияет на ЭЛО)*"
-        ),
+            "*(Этот матч не влияет на ЭЛО)*"
+        )
+
+    result_embed = discord.Embed(
+        title=match_title,
+        description=desc,
         color=0xFEE75C,
     )
     result_embed.add_field(
@@ -754,12 +774,18 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
         inline=False
     )
 
-    view = PlayerRerollView()
-    await lobby.text_channel.send(
-        content=mentions,
-        embed=result_embed,
-        view=view
-    )
+    if lobby.match_type == "ranked":
+        await lobby.text_channel.send(
+            content=mentions,
+            embed=result_embed
+        )
+    else:
+        view = PlayerRerollView()
+        await lobby.text_channel.send(
+            content=mentions,
+            embed=result_embed,
+            view=view
+        )
 
     active_lobbies.pop(lobby.voice_channel.id, None)
 
