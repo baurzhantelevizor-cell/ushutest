@@ -611,7 +611,7 @@ async def on_ready():
             for g_id in guild_ids:
                 try:
                     guild_obj = discord.Object(id=g_id)
-                    bot.tree.clear(guild=guild_obj) # Очищаем старые команды
+                    bot.tree.clear_commands(guild=guild_obj) # Очищаем старые команды
                     bot.tree.copy_global_to(guild=guild_obj)
                     synced = await bot.tree.sync(guild=guild_obj)
                     print(f"[BOT] Синхронизировано {len(synced)} команд для гильдии {g_id}.")
