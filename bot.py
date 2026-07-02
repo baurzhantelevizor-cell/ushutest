@@ -600,13 +600,22 @@ async def on_ready():
     # Регистрируем persistent view для кнопки
     bot.add_view(ReadyView())
 
-    # Синхронизируем слэш-команды
+    # Синхронизируем слэш-команды для указанных серверов
     try:
-        if GUILD_ID:
-            guild_obj = discord.Object(id=GUILD_ID)
-            bot.tree.copy_global_to(guild=guild_obj)
-            synced = await bot.tree.sync(guild=guild_obj)
-            print(f"[BOT] Синхронизировано {len(synced)} команд для гильдии {GUILD_ID}.")
+        # Получаем оригинальную строку из окружения
+        guild_ids_str = os.environ.get("GUILD_ID", "")
+        # Разбиваем по запятой и превращаем в инты
+        guild_ids = [int(x.strip()) for x in guild_ids_str.split(",") if x.strip()]
+        
+        if guild_ids:
+            for g_id in guild_ids:
+                try:
+                    guild_obj = discord.Object(id=g_id)
+                    bot.tree.copy_global_to(guild=guild_obj)
+                    synced = await bot.tree.sync(guild=guild_obj)
+                    print(f"[BOT] Синхронизировано {len(synced)} команд для гильдии {g_id}.")
+                except Exception as e_guild:
+                    print(f"[BOT] Ошибка синхронизации для гильдии {g_id}: {e_guild}")
         else:
             synced = await bot.tree.sync()
             print(f"[BOT] Синхронизировано {len(synced)} глобальных команд.")
