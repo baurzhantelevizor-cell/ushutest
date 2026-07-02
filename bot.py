@@ -1696,6 +1696,8 @@ async def cmd_random(interaction: discord.Interaction, role: app_commands.Choice
 )
 @app_commands.default_permissions(administrator=True)
 async def cmd_start_test(interaction: discord.Interaction):
+    await interaction.response.defer()
+
     # Для полноценного теста сделаем так, чтобы ТЫ (тот, кто ввёл команду) был одним из игроков (Player 1)
     # Это позволит тебе нажимать кнопку «Реролл» и видеть, как меняется твой герой!
     caller = interaction.user
