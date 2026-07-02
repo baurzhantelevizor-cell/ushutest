@@ -714,10 +714,55 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
                     except discord.Forbidden:
                         pass
 
-        if moved_count > 0:
-            move_notes = f"\n👉 Перемещено игроков в каналы команд: **{moved_count}** из 10."
-        elif chan_team1 or chan_team2:
-            move_notes = "\n⚠️ Не удалось переместить игроков (возможно, у бота нет прав «Перемещать участников»)."
+    # ─── СОЗДАНИЕ ЕДИНОГО EMBED'А РЕЗУЛЬТАТА ───
+    role_emojis = {
+        "gold": "🪙 Gold",
+        "exp": "🛡️ Exp",
+        "mid": "🔮 Mid",
+        "jungle": "⚔️ Jungle",
+        "roam": "👣 Roam"
+    }
+
+    def build_embed_team_section(team_full_list: list) -> str:
+        sec_lines = []
+        for idx, (m, elo, hero, role) in enumerate(team_full_list, start=1):
+            role_label = role_emojis.get(role, role.capitalize())
+            sec_lines.append(f"`{idx}.` {m.mention}\n    {role_label} · 🦸 : **{hero}**")
+        return "\n".join(sec_lines)
+
+    result_embed = discord.Embed(
+        title=match_title,
+        description=(
+            f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Герои распределены по ролям. Удачи на поле боя! 🎮\n"
+            "Если у вас нет выпавшего героя, нажмите кнопку **Реролл 🎲** ниже"
+            f"{move_notes}\n\n"
+            "**После игры администратор может выбрать победителя с помощью `/win_team`**" if lobby.match_type == "ranked"
+            else f"Герои распределены. Удачи на поле боя! 🎮\nЕсли у вас нет выпавшего героя, нажмите кнопку **Реролл 🎲** ниже{move_notes}\n\n*(Этот матч не влияет на ЭЛО)*"
+        ),
+        color=0xFEE75C,
+    )
+    result_embed.add_field(
+        name=f"🔵 КОМАНДА 1 (Суммарный ЭЛО: {total_a})",
+        value=build_embed_team_section(team_a_full),
+        inline=False
+    )
+    result_embed.add_field(
+        name=f"🔴 КОМАНДА 2 (Суммарный ЭЛО: {total_b})",
+        value=build_embed_team_section(team_b_full),
+        inline=False
+    )
+
+    view = PlayerRerollView()
+    await lobby.text_channel.send(
+        content=mentions,
+        embed=result_embed,
+        view=view
+    )
+
+    active_lobbies.pop(lobby.voice_channel.id, None)
+
 
 # ═══════════════════════ PLAYER REROLL BUTTON VIEW ═══════════════════════
 class PlayerRerollButton(discord.ui.Button):
@@ -840,7 +885,6 @@ class PlayerRerollButton(discord.ui.Button):
                 p_team = p["team_name"]
                 r_label = role_emojis.get(p_role, p_role.capitalize())
 
-                line_str = f"`{idx1 if p_team == 'Команда 1' else idx2}.` <@{p_id}> — *герой обновлен*\n    {r_label} · 🦸 : **{p_hero}**"
                 if p_team == "Команда 1":
                     team1_lines.append(f"`{idx1}.` <@{p_id}>\n    {r_label} · 🦸 : **{p_hero}**")
                     idx1 += 1
@@ -871,56 +915,6 @@ class PlayerRerollView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)  # Кнопка работает без таймаута
         self.add_item(PlayerRerollButton())
-
-
-    # ─── СОЗДАНИЕ ЕДИНОГО EMBED'А РЕЗУЛЬТАТА ───
-    role_emojis = {
-        "gold": "🪙 Gold",
-        "exp": "🛡️ Exp",
-        "mid": "🔮 Mid",
-        "jungle": "⚔️ Jungle",
-        "roam": "👣 Roam"
-    }
-
-    def build_embed_team_section(team_full_list: list) -> str:
-        sec_lines = []
-        for idx, (m, elo, hero, role) in enumerate(team_full_list, start=1):
-            role_label = role_emojis.get(role, role.capitalize())
-            sec_lines.append(f"`{idx}.` {m.mention}\n    {role_label} · 🦸 : **{hero}**")
-        return "\n".join(sec_lines)
-
-    result_embed = discord.Embed(
-        title=match_title,
-        description=(
-            f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Герои распределены по ролям. Удачи на поле боя! 🎮\n"
-            "Если у вас нет выпавшего героя, нажмите кнопку **Реролл 🎲** ниже"
-            f"{move_notes}\n\n"
-            "**После игры администратор может выбрать победителя с помощью `/win_team`**" if lobby.match_type == "ranked"
-            else f"Герои распределены. Удачи на поле боя! 🎮\nЕсли у вас нет выпавшего героя, нажмите кнопку **Реролл 🎲** ниже{move_notes}\n\n*(Этот матч не влияет на ЭЛО)*"
-        ),
-        color=0xFEE75C,
-    )
-    result_embed.add_field(
-        name=f"🔵 КОМАНДА 1 (Суммарный ЭЛО: {total_a})",
-        value=build_embed_team_section(team_a_full),
-        inline=False
-    )
-    result_embed.add_field(
-        name=f"🔴 КОМАНДА 2 (Суммарный ЭЛО: {total_b})",
-        value=build_embed_team_section(team_b_full),
-        inline=False
-    )
-
-    view = PlayerRerollView()
-    await lobby.text_channel.send(
-        content=mentions,
-        embed=result_embed,
-        view=view
-    )
-
-    active_lobbies.pop(lobby.voice_channel.id, None)
 
 
 # ═══════════════════════════ EVENTS ══════════════════════════════
