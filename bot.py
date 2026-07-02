@@ -700,35 +700,36 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
     
     # ─── АВТОПЕРЕНОС ИГРОКОВ В ГОЛОСОВЫЕ КАНАЛЫ КОМАНД ───
     move_notes = ""
-    guild_id = lobby.voice_channel.guild.id
-    v_team1_id = get_guild_voice_team1(guild_id)
-    v_team2_id = get_guild_voice_team2(guild_id)
+    if lobby.match_type in ("ranked", "classic"):
+        guild_id = lobby.voice_channel.guild.id
+        v_team1_id = get_guild_voice_team1(guild_id)
+        v_team2_id = get_guild_voice_team2(guild_id)
 
-    chan_team1 = lobby.voice_channel.guild.get_channel(v_team1_id) if v_team1_id else None
-    chan_team2 = lobby.voice_channel.guild.get_channel(v_team2_id) if v_team2_id else None
+        chan_team1 = lobby.voice_channel.guild.get_channel(v_team1_id) if v_team1_id else None
+        chan_team2 = lobby.voice_channel.guild.get_channel(v_team2_id) if v_team2_id else None
 
-    moved_count = 0
-    if chan_team1:
-        for member, _, _, _ in team_a_full:
-            if member.voice and member.voice.channel:
-                try:
-                    await member.move_to(chan_team1)
-                    moved_count += 1
-                except discord.Forbidden:
-                    pass
-    if chan_team2:
-        for member, _, _, _ in team_b_full:
-            if member.voice and member.voice.channel:
-                try:
-                    await member.move_to(chan_team2)
-                    moved_count += 1
-                except discord.Forbidden:
-                    pass
+        moved_count = 0
+        if chan_team1:
+            for member, _, _, _ in team_a_full:
+                if member.voice and member.voice.channel:
+                    try:
+                        await member.move_to(chan_team1)
+                        moved_count += 1
+                    except discord.Forbidden:
+                        pass
+        if chan_team2:
+            for member, _, _, _ in team_b_full:
+                if member.voice and member.voice.channel:
+                    try:
+                        await member.move_to(chan_team2)
+                        moved_count += 1
+                    except discord.Forbidden:
+                        pass
 
-    if moved_count > 0:
-        move_notes = f"\n👉 Перемещено игроков в каналы команд: **{moved_count}** из 10."
-    elif chan_team1 or chan_team2:
-        move_notes = "\n⚠️ Не удалось переместить игроков (возможно, у бота нет прав «Перемещать участников»)."
+        if moved_count > 0:
+            move_notes = f"\n👉 Перемещено игроков в каналы команд: **{moved_count}** из 10."
+        elif chan_team1 or chan_team2:
+            move_notes = "\n⚠️ Не удалось переместить игроков (возможно, у бота нет прав «Перемещать участников»)."
 
     header_embed = discord.Embed(
         title=match_title,
