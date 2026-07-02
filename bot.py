@@ -32,7 +32,7 @@ GUILD_ID = int(os.environ.get("GUILD_ID", "0"))
 HEROES_FILE = Path(__file__).parent / "heroes.txt"
 
 # Дефолтный ЭЛО для новых игроков
-DEFAULT_ELO = 1000
+DEFAULT_ELO = 500
 
 # ─────────────────────────── БОТ ─────────────────────────────────
 intents = discord.Intents.default()
@@ -56,7 +56,7 @@ async def init_db() -> asyncpg.Pool:
             """
             CREATE TABLE IF NOT EXISTS players (
                 user_id  BIGINT PRIMARY KEY,
-                elo      INTEGER NOT NULL DEFAULT 1000
+                elo      INTEGER NOT NULL DEFAULT 500
             );
             """
         )
