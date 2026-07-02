@@ -611,6 +611,7 @@ async def on_ready():
             for g_id in guild_ids:
                 try:
                     guild_obj = discord.Object(id=g_id)
+                    bot.tree.clear(guild=guild_obj) # Очищаем старые команды
                     bot.tree.copy_global_to(guild=guild_obj)
                     synced = await bot.tree.sync(guild=guild_obj)
                     print(f"[BOT] Синхронизировано {len(synced)} команд для гильдии {g_id}.")
@@ -842,13 +843,6 @@ async def cmd_start_dalbaeb(interaction: discord.Interaction):
     await run_lobby_init(interaction, "chaos", "Хаос")
 
 
-# Для совместимости оставим обычный /start, он будет вести себя как Ranked
-@bot.tree.command(
-    name="start",
-    description="Начать сбор на рейтинговый матч 5×5 в Mobile Legends"
-)
-async def cmd_start(interaction: discord.Interaction):
-    await run_lobby_init(interaction, "ranked", "Рейтинговый")
 
 
 # ───────────── /set_elo ───────────────
