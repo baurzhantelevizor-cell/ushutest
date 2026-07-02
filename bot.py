@@ -80,6 +80,12 @@ async def init_db() -> asyncpg.Pool:
         except Exception:
             pass
 
+        try:
+            await conn.execute("ALTER TABLE active_match_heroes ADD COLUMN IF NOT EXISTS team_name VARCHAR(50) NOT NULL DEFAULT 'Команда 1';")
+            await conn.execute("ALTER TABLE active_match_heroes ADD COLUMN IF NOT EXISTS is_ranked BOOLEAN NOT NULL DEFAULT TRUE;")
+        except Exception:
+            pass
+
         # Таблица для хранения выданных игроков в матче
         await conn.execute(
             """
@@ -781,6 +787,83 @@ async def on_ready():
 
 
 @bot.event
+# ═══════════════════════ AUTO WIN DECISION VIEW ═══════════════════════
+class AutoWinPollView(discord.ui.View):
+    """Интерактивные кнопки выбора победителя после возвращения игроков."""
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=600)
+        self.guild_id = guild_id
+
+    async def check_moderator(self, interaction: discord.Interaction) -> bool:
+        if not is_moderator(interaction.user):
+            await interaction.response.send_message(
+                "❌ Только ведущий матча (или администратор) может выбрать победителя.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    async def apply_win(self, interaction: discord.Interaction, winner_team_val: str):
+        if not await self.check_moderator(interaction):
+            return
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        async with db_pool.acquire() as conn:
+            players = await conn.fetch(
+                """
+                SELECT user_id, team_name, is_ranked 
+                FROM active_match_heroes 
+                WHERE guild_id = $1
+                """,
+                self.guild_id
+            )
+
+            if not players:
+                await interaction.followup.send("❌ Данные об активном матче не найдены или уже были удалены.", ephemeral=True)
+                return
+
+            is_ranked_match = players[0]["is_ranked"]
+            winners_ids = [p["user_id"] for p in players if p["team_name"] == winner_team_val]
+
+            if not winners_ids:
+                await interaction.followup.send("❌ Не удалось найти игроков выбранной команды.", ephemeral=True)
+                return
+
+            if is_ranked_match:
+                for uid in winners_ids:
+                    await conn.execute(
+                        """
+                        INSERT INTO players (user_id, elo) VALUES ($1, $2)
+                        ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 50
+                        """,
+                        uid, DEFAULT_ELO + 50
+                    )
+                
+                await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", self.guild_id)
+                mentions = " ".join(f"<@{uid}>" for uid in winners_ids)
+                await interaction.followup.send(
+                    f"🎉 **Команда {winner_team_val} побеждает в рейтинговом матче!**\n"
+                    f"Все участники команды получают **+50 ЭЛО**:\n{mentions}"
+                )
+            else:
+                await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", self.guild_id)
+                await interaction.followup.send(
+                    f"🎉 **Команда {winner_team_val} побеждает!**\n*(Этот матч был не рейтинговым, ЭЛО начислено не было)*"
+                )
+
+    @discord.ui.button(label="🔵 Команда 1", style=discord.ButtonStyle.primary)
+    async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.apply_win(interaction, "Команда 1")
+
+    @discord.ui.button(label="🔴 Команда 2", style=discord.ButtonStyle.danger)
+    async def team2_win(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.apply_win(interaction, "Команда 2")
+
+
+@bot.event
 async def on_voice_state_update(
     member: discord.Member,
     before: discord.VoiceState,
@@ -788,7 +871,9 @@ async def on_voice_state_update(
 ):
     guild_id = member.guild.id
     configured_vc = get_guild_voice_channel(guild_id)
+    ready_ch_id = get_guild_ready_channel(guild_id)
 
+    # 1. Обновление обычного лобби сбора
     channels_to_check: set[int] = set()
     if before.channel:
         channels_to_check.add(before.channel.id)
@@ -825,6 +910,47 @@ async def on_voice_state_update(
                 await lobby.message.edit(embed=embed)
             except discord.NotFound:
                 active_lobbies.pop(vc_id, None)
+
+    # 2. Логика автоопределения окончания матча при возвращении 5+ игроков в войс сбора
+    # Срабатывает только если пользователь перешел в нужный голосовой канал
+    if after.channel and configured_vc and after.channel.id == configured_vc:
+        async with db_pool.acquire() as conn:
+            # Получаем игроков активного матча
+            active_players = await conn.fetch(
+                "SELECT user_id FROM active_match_heroes WHERE guild_id = $1",
+                guild_id
+            )
+
+            if active_players and len(active_players) >= 10:
+                active_ids = {p["user_id"] for p in active_players}
+                
+                # Считаем, сколько участников активного матча сейчас находятся в голосовом канале сбора
+                vc_members = after.channel.members
+                returned_count = sum(1 for m in vc_members if m.id in active_ids)
+
+                # Если вернулось 5 и более игроков
+                if returned_count >= 5:
+                    # Отправляем опрос в текстовый канал сбора (ready_channel)
+                    text_channel = member.guild.get_channel(ready_ch_id) if ready_ch_id else None
+                    if text_channel:
+                        # Проверяем, не отправляли ли мы уже такой опрос недавно, чтобы не спамить
+                        # Для этого проверяем историю сообщений
+                        already_asked = False
+                        async for msg in text_channel.history(limit=5):
+                            if "Какая команда выиграла?" in msg.content and not msg.author.bot:
+                                continue
+                            if "Какая команда выиграла?" in msg.content and msg.author == bot.user:
+                                # Если на кнопках еще не кликнули, значит опрос висит
+                                if any(not btn.disabled for btn in msg.components[0].children if isinstance(btn, discord.ui.Button)):
+                                    already_asked = True
+                                    break
+
+                        if not already_asked:
+                            view = AutoWinPollView(guild_id)
+                            await text_channel.send(
+                                content="🎮 **Большинство игроков вернулись в лобби сбора!**\nВедущий, выберите, какая команда выиграла матч:",
+                                view=view
+                            )
 
 
 # ═══════════════════════════ SLASH COMMANDS ══════════════════════
