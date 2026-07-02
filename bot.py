@@ -83,6 +83,7 @@ async def init_db() -> asyncpg.Pool:
         try:
             await conn.execute("ALTER TABLE active_match_heroes ADD COLUMN IF NOT EXISTS team_name VARCHAR(50) NOT NULL DEFAULT 'Команда 1';")
             await conn.execute("ALTER TABLE active_match_heroes ADD COLUMN IF NOT EXISTS is_ranked BOOLEAN NOT NULL DEFAULT TRUE;")
+            await conn.execute("ALTER TABLE active_match_heroes ADD COLUMN IF NOT EXISTS rerolls INTEGER NOT NULL DEFAULT 0;")
         except Exception:
             pass
 
@@ -96,7 +97,8 @@ async def init_db() -> asyncpg.Pool:
                 role      VARCHAR(50) NOT NULL,
                 match_id  VARCHAR(100) NOT NULL,
                 team_name VARCHAR(50) NOT NULL DEFAULT 'Команда 1',
-                is_ranked BOOLEAN NOT NULL DEFAULT TRUE
+                is_ranked BOOLEAN NOT NULL DEFAULT TRUE,
+                rerolls   INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -1246,28 +1248,72 @@ async def cmd_cancel(interaction: discord.Interaction):
         )
 
 
+# ───────────── /cancel_match ────────────
+@bot.tree.command(name="cancel_match", description="[Админ/Ведущий] Отменить текущий активный (запущенный) матч без начисления ЭЛО")
+async def cmd_cancel_match(interaction: discord.Interaction):
+    if not is_moderator(interaction.user):
+        await interaction.response.send_message(
+            "❌ У вас нет прав Ведущего или Администратора для отмены матча.",
+            ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild_id
+    async with db_pool.acquire() as conn:
+        players = await conn.fetch(
+            "SELECT user_id FROM active_match_heroes WHERE guild_id = $1",
+            guild_id
+        )
+
+        if not players:
+            await interaction.response.send_message(
+                "❌ Нет запущенного активного матча для отмены.",
+                ephemeral=True
+            )
+            return
+
+        await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", guild_id)
+        await interaction.response.send_message(
+            "🛑 **Текущий активный матч был отменён Ведущим/Администратором.** Данные матча стёрты, ЭЛО не изменено."
+        )
+
+
 # ───────────── /reroll ────────────────
 @bot.tree.command(
     name="reroll",
-    description="Перекрутить (заменить) вашего выданного героя на другого для вашей роли"
+    description="Перекрутить (заменить) выданного героя на другого для роли (Лимит: 2 раза)"
 )
-async def cmd_reroll(interaction: discord.Interaction):
-    user = interaction.user
+@app_commands.describe(player="[Ведущий/Админ] Игрок, которому нужно заменить героя (по умолчанию — вы сами)")
+async def cmd_reroll(interaction: discord.Interaction, player: discord.Member | None = None):
+    caller = interaction.user
     guild_id = interaction.guild_id
+
+    # Определяем, чьего героя мы крутим
+    target_user = player if player else caller
+
+    # Если крутим за другого игрока, проверяем, является ли вызвавший ведущим/админом
+    if target_user.id != caller.id:
+        if not is_moderator(caller):
+            await interaction.response.send_message(
+                "❌ Вы можете заменять героев только себе. Заменять героев другим игрокам могут только Ведущий или Администраторы.",
+                ephemeral=True
+            )
+            return
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT hero_name, role, match_id, is_ranked 
+            SELECT hero_name, role, match_id, is_ranked, rerolls 
             FROM active_match_heroes 
             WHERE user_id = $1 AND guild_id = $2
             """,
-            user.id, guild_id
+            target_user.id, guild_id
         )
 
         if not row:
+            msg_target = "Вы не участвуете" if target_user.id == caller.id else f"Игрок **{target_user.display_name}** не участвует"
             await interaction.response.send_message(
-                "❌ Вы не участвуете в текущем сформированном матче.",
+                f"❌ {msg_target} в текущем сформированном матче.",
                 ephemeral=True
             )
             return
@@ -1275,6 +1321,16 @@ async def cmd_reroll(interaction: discord.Interaction):
         current_hero = row["hero_name"]
         role = row["role"]
         match_id = row["match_id"]
+        current_rerolls = row["rerolls"]
+
+        # Проверка лимита в 2 реролла
+        if current_rerolls >= 2:
+            msg_limit = "Вы исчерпали" if target_user.id == caller.id else f"Игрок **{target_user.display_name}** исчерпал"
+            await interaction.response.send_message(
+                f"❌ {msg_limit} лимит замен героев (максимум 2 замены на матч).",
+                ephemeral=True
+            )
+            return
 
         busy_rows = await conn.fetch(
             "SELECT hero_name FROM active_match_heroes WHERE match_id = $1",
@@ -1299,14 +1355,15 @@ async def cmd_reroll(interaction: discord.Interaction):
             return
 
         new_hero = random.choice(role_heroes)
+        new_reroll_count = current_rerolls + 1
 
         await conn.execute(
             """
             UPDATE active_match_heroes 
-            SET hero_name = $1 
-            WHERE user_id = $2 AND guild_id = $3
+            SET hero_name = $1, rerolls = $2
+            WHERE user_id = $3 AND guild_id = $4
             """,
-            new_hero, user.id, guild_id
+            new_hero, new_reroll_count, target_user.id, guild_id
         )
 
         role_emojis = {
@@ -1318,9 +1375,10 @@ async def cmd_reroll(interaction: discord.Interaction):
         }
         role_label = role_emojis.get(role, role.capitalize())
 
+        actor_str = "" if target_user.id == caller.id else f" *(выполнено ведущим {caller.mention})*"
         await interaction.response.send_message(
-            f"🔄 {user.mention}, ваш герой был заменен!\n"
-            f"Роль: **{role_label}**\n"
+            f"🔄 {target_user.mention}, герой был заменен!{actor_str}\n"
+            f"Роль: **{role_label}** · Попытка: **{new_reroll_count}/2**\n"
             f"Старый герой: ~~{current_hero}~~\n"
             f"Новый герой: **{new_hero}**"
         )
