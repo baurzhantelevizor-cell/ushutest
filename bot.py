@@ -15,6 +15,12 @@ from discord.ext import commands
 import asyncpg
 from dotenv import load_dotenv
 
+# Импортируем маппинг ролей героев
+try:
+    from roles import HERO_ROLES
+except ImportError:
+    HERO_ROLES = {}
+
 # ─────────────────────────── .env ────────────────────────────────
 load_dotenv()  # Загружает .env в os.environ (на Railway .env не нужен)
 
@@ -60,6 +66,18 @@ async def init_db() -> asyncpg.Pool:
                 guild_id          BIGINT PRIMARY KEY,
                 voice_channel_id  BIGINT,
                 ready_channel_id  BIGINT
+            );
+            """
+        )
+        # Таблица для хранения выданных игрокам героев в текущих матчах
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS active_match_heroes (
+                user_id   BIGINT PRIMARY KEY,
+                guild_id  BIGINT NOT NULL,
+                hero_name VARCHAR(100) NOT NULL,
+                role      VARCHAR(50) NOT NULL,
+                match_id  VARCHAR(100) NOT NULL
             );
             """
         )
@@ -159,7 +177,7 @@ async def get_elos_bulk(user_ids: list[int]) -> dict[int, int]:
     return result
 
 
-# ═══════════════════════════ HEROES ══════════════════════════════
+# ═══════════════════════════ HEROES & ROLES ══════════════════════
 def load_heroes() -> list[str]:
     """Загружает список героев из heroes.txt."""
     with open(HEROES_FILE, encoding="utf-8") as f:
@@ -169,6 +187,36 @@ def load_heroes() -> list[str]:
             f"В heroes.txt слишком мало героев ({len(heroes)}). Нужно минимум 10."
         )
     return heroes
+
+
+def pick_unique_heroes_by_roles(heroes: list[str]) -> list[tuple[str, str]]:
+    """
+    Выбирает по 2 уникальных героя для каждой роли:
+    gold, exp, mid, jungle, roam.
+    Возвращает список из 10 кортежей (имя_героя, роль).
+    """
+    # Распределяем доступных героев по 5 спискам
+    by_role = {"gold": [], "exp": [], "mid": [], "jungle": [], "roam": []}
+    for h in heroes:
+        role = HERO_ROLES.get(h, "exp")  # По дефолту exp, если нет в словаре
+        if role in by_role:
+            by_role[role].append(h)
+
+    result = []
+    roles_list = ["gold", "exp", "mid", "jungle", "roam"]
+    for role in roles_list:
+        role_heroes = by_role[role]
+        if len(role_heroes) < 2:
+            # Если для какой-то роли мало героев, добираем из всех
+            available = [h for h in heroes if h not in [r[0] for r in result]]
+            sampled = random.sample(available, 2)
+            for h in sampled:
+                result.append((h, role))
+        else:
+            sampled = random.sample(role_heroes, 2)
+            for h in sampled:
+                result.append((h, role))
+    return result
 
 
 def pick_unique_heroes(heroes: list[str], count: int = 10) -> list[str]:
@@ -194,7 +242,6 @@ def balance_teams_snake(
     team_b: list[tuple[discord.Member, int]] = []
 
     for idx, player in enumerate(sorted_players):
-        # «Змейка»: 0→A, 1→B, 2→B, 3→A, 4→A, 5→B, 6→B, 7→A, 8→A, 9→B
         if idx % 2 == 0:
             team_a.append(player)
         else:
@@ -252,7 +299,7 @@ def build_lobby_embed(
 
 
 def build_result_embed(
-    team: list[tuple[discord.Member, int, str]],
+    team: list[tuple[discord.Member, int, str, str]],
     team_name: str,
     color: int,
     total_elo: int,
@@ -264,11 +311,20 @@ def build_result_embed(
         color=color,
     )
 
+    role_emojis = {
+        "gold": "🪙 Gold",
+        "exp": "🛡️ Exp",
+        "mid": "🔮 Mid",
+        "jungle": "⚔️ Jungle",
+        "roam": "👣 Roam"
+    }
+
     lines: list[str] = []
-    for idx, (member, elo, hero) in enumerate(team, start=1):
+    for idx, (member, elo, hero, role) in enumerate(team, start=1):
+        role_label = role_emojis.get(role, role.capitalize())
         lines.append(
             f"`{idx}.` {member.mention} — 🎖️ {elo} ЭЛО\n"
-            f"    🦸 Герой: **{hero}**"
+            f"    Роль: **{role_label}** · 🦸 Герой: **{hero}**"
         )
 
     embed.add_field(
@@ -383,7 +439,9 @@ class ReadyView(discord.ui.View):
 async def start_match(lobby: LobbyState, players: list[discord.Member]):
     """Формирует команды, раздаёт героев и выводит результат."""
     heroes = load_heroes()
-    picked = pick_unique_heroes(heroes, 10)
+    
+    # Распределяем роли и героев: 5 ролей, по 2 уникальных героя на роль
+    role_picks = pick_unique_heroes_by_roles(heroes)
 
     # Получаем ЭЛО из БД
     user_ids = [p.id for p in players]
@@ -392,17 +450,48 @@ async def start_match(lobby: LobbyState, players: list[discord.Member]):
     players_with_elo = [(p, elos[p.id]) for p in players]
     team_a, team_b = balance_teams_snake(players_with_elo)
 
-    # Раздаём героев
-    random.shuffle(picked)
-    team_a_full = [
-        (member, elo, picked[i]) for i, (member, elo) in enumerate(team_a)
-    ]
-    team_b_full = [
-        (member, elo, picked[i + 5]) for i, (member, elo) in enumerate(team_b)
-    ]
+    # Каждой команде выдаём по одному герою каждого типа
+    # Роли: gold, exp, mid, jungle, roam
+    roles_order = ["gold", "exp", "mid", "jungle", "roam"]
+    
+    # Разделяем героев по ролям
+    role_to_heroes = {r: [] for r in roles_order}
+    for h_name, role in role_picks:
+        role_to_heroes[role].append(h_name)
 
-    total_a = sum(elo for _, elo, _ in team_a_full)
-    total_b = sum(elo for _, elo, _ in team_b_full)
+    # Распределяем роли внутри команд
+    # Для Команды 1
+    team_a_full = []
+    for i, (member, elo) in enumerate(team_a):
+        role = roles_order[i]
+        hero = role_to_heroes[role][0]
+        team_a_full.append((member, elo, hero, role))
+
+    # Для Команды 2
+    team_b_full = []
+    for i, (member, elo) in enumerate(team_b):
+        role = roles_order[i]
+        hero = role_to_heroes[role][1]
+        team_b_full.append((member, elo, hero, role))
+
+    total_a = sum(elo for _, elo, _, _ in team_a_full)
+    total_b = sum(elo for _, elo, _, _ in team_b_full)
+
+    # Сохраняем выданных героев в БД для возможности крутки (reroll)
+    match_id = f"{lobby.voice_channel.id}_{int(asyncio.get_event_loop().time())}"
+    async with db_pool.acquire() as conn:
+        # Сначала очистим старые записи для этой гильдии
+        await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", lobby.voice_channel.guild.id)
+        
+        # Сохраняем новых
+        for member, elo, hero, role in team_a_full + team_b_full:
+            await conn.execute(
+                """
+                INSERT INTO active_match_heroes (user_id, guild_id, hero_name, role, match_id)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                member.id, lobby.voice_channel.guild.id, hero, role, match_id
+            )
 
     embed_a = build_result_embed(team_a_full, "🔵 КОМАНДА 1", EMBED_COLOR_TEAM_A, total_a)
     embed_b = build_result_embed(team_b_full, "🔴 КОМАНДА 2", EMBED_COLOR_TEAM_B, total_b)
@@ -414,7 +503,8 @@ async def start_match(lobby: LobbyState, players: list[discord.Member]):
         description=(
             f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Удачи на поле боя! 🎮"
+            "Игроки распределены по ролям. Удачи на поле боя! 🎮\n"
+            "Если у вас нет выпавшего героя, напишите слэш-команду `/reroll`"
         ),
         color=0xFEE75C,
     )
@@ -424,7 +514,7 @@ async def start_match(lobby: LobbyState, players: list[discord.Member]):
         embeds=[header_embed, embed_a, embed_b],
     )
 
-    # Удаляем лобби
+    # Удаляем лобби из активных сборов
     active_lobbies.pop(lobby.voice_channel.id, None)
 
 
@@ -561,7 +651,7 @@ async def cmd_settings(interaction: discord.Interaction):
     )
     embed.add_field(name="🔊 Голосовой канал", value=vc_text, inline=False)
     embed.add_field(name="📝 Текстовый канал (лобби)", value=rc_text, inline=False)
-    embed.set_footer(text="Используй /set_voice и /set_ready для настройки")
+    embed.set_footer(text="Используй /set_voice and /set_ready для настройки")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -622,8 +712,6 @@ async def cmd_start(interaction: discord.Interaction):
         msg = await interaction.original_response()
         lobby = LobbyState(voice_channel, interaction.channel, msg)
     elif configured_rc:
-        # Автор написал /start не в настроенном канале — уже отсеяли выше,
-        # но на всякий случай:
         target_ch = interaction.guild.get_channel(configured_rc)
         if target_ch is None:
             await interaction.response.send_message(
@@ -708,6 +796,91 @@ async def cmd_cancel(interaction: discord.Interaction):
         )
 
 
+# ───────────── /reroll ────────────────
+@bot.tree.command(
+    name="reroll",
+    description="Перекрутить (заменить) вашего выданного героя на другого для вашей роли"
+)
+async def cmd_reroll(interaction: discord.Interaction):
+    user = interaction.user
+    guild_id = interaction.guild_id
+
+    async with db_pool.acquire() as conn:
+        # Проверяем, есть ли активный герой у игрока в этой гильдии
+        row = await conn.fetchrow(
+            """
+            SELECT hero_name, role, match_id 
+            FROM active_match_heroes 
+            WHERE user_id = $1 AND guild_id = $2
+            """,
+            user.id, guild_id
+        )
+
+        if not row:
+            await interaction.response.send_message(
+                "❌ Вы не участвуете в текущем сформированном матче.",
+                ephemeral=True
+            )
+            return
+
+        current_hero = row["hero_name"]
+        role = row["role"]
+        match_id = row["match_id"]
+
+        # Получаем всех героев, которые сейчас выданы в этом матче, чтобы избежать повторов
+        busy_rows = await conn.fetch(
+            "SELECT hero_name FROM active_match_heroes WHERE match_id = $1",
+            match_id
+        )
+        busy_heroes = {r["hero_name"] for r in busy_rows}
+
+        # Выбираем всех героев с такой же ролью
+        heroes = load_heroes()
+        role_heroes = [
+            h for h in heroes 
+            if HERO_ROLES.get(h, "exp") == role and h not in busy_heroes and h != current_hero
+        ]
+
+        if not role_heroes:
+            # Если нет свободных героев с этой ролью, берем из общего пула (кроме занятых)
+            role_heroes = [h for h in heroes if h not in busy_heroes and h != current_hero]
+
+        if not role_heroes:
+            await interaction.response.send_message(
+                "❌ К сожалению, нет доступных героев для замены.",
+                ephemeral=True
+            )
+            return
+
+        new_hero = random.choice(role_heroes)
+
+        # Обновляем героя в БД
+        await conn.execute(
+            """
+            UPDATE active_match_heroes 
+            SET hero_name = $1 
+            WHERE user_id = $2 AND guild_id = $3
+            """,
+            new_hero, user.id, guild_id
+        )
+
+        role_emojis = {
+            "gold": "🪙 Gold",
+            "exp": "🛡️ Exp",
+            "mid": "🔮 Mid",
+            "jungle": "⚔️ Jungle",
+            "roam": "👣 Roam"
+        }
+        role_label = role_emojis.get(role, role.capitalize())
+
+        await interaction.response.send_message(
+            f"🔄 {user.mention}, ваш герой был заменен!\n"
+            f"Роль: **{role_label}**\n"
+            f"Старый герой: ~~{current_hero}~~\n"
+            f"Новый герой: **{new_hero}**"
+        )
+
+
 # ───────────── /start_test ────────────
 @bot.tree.command(
     name="start_test",
@@ -736,28 +909,42 @@ async def cmd_start_test(interaction: discord.Interaction):
         else:
             team_b_idx.append(orig_idx)
 
-    # Рандомные герои
+    # Рандомные герои по ролям
     heroes = load_heroes()
-    picked = pick_unique_heroes(heroes, 10)
-    random.shuffle(picked)
+    role_picks = pick_unique_heroes_by_roles(heroes)
+    
+    roles_order = ["gold", "exp", "mid", "jungle", "roam"]
+    role_to_heroes = {r: [] for r in roles_order}
+    for h_name, role in role_picks:
+        role_to_heroes[role].append(h_name)
 
     # Сборка команд
-    def build_test_team_lines(indices: list[int], hero_offset: int) -> tuple[str, int]:
+    role_emojis = {
+        "gold": "🪙 Gold",
+        "exp": "🛡️ Exp",
+        "mid": "🔮 Mid",
+        "jungle": "⚔️ Jungle",
+        "roam": "👣 Roam"
+    }
+
+    def build_test_team_lines(indices: list[int], hero_index: int) -> tuple[str, int]:
         lines = []
         total = 0
         for i, idx in enumerate(indices):
             name = fake_names[idx]
             elo = fake_elos[idx]
-            hero = picked[hero_offset + i]
+            role = roles_order[i]
+            hero = role_to_heroes[role][hero_index]
             total += elo
+            role_label = role_emojis.get(role, role.capitalize())
             lines.append(
                 f"`{i+1}.` **{name}** — 🎖️ {elo} ЭЛО\n"
-                f"    🦸 Герой: **{hero}**"
+                f"    Роль: **{role_label}** · 🦸 Герой: **{hero}**"
             )
         return "\n".join(lines), total
 
     lines_a, total_a = build_test_team_lines(team_a_idx, 0)
-    lines_b, total_b = build_test_team_lines(team_b_idx, 5)
+    lines_b, total_b = build_test_team_lines(team_b_idx, 1)
 
     # ── Embed: лобби (как выглядит сбор, когда все готовы) ──
     lobby_embed = discord.Embed(
@@ -785,7 +972,7 @@ async def cmd_start_test(interaction: discord.Interaction):
         description=(
             f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Удачи на поле боя! 🎮"
+            "Игроки распределены по ролям. Удачи на поле боя! 🎮"
         ),
         color=0xFEE75C,
     )
