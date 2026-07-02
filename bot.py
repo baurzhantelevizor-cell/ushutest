@@ -1474,7 +1474,7 @@ async def cmd_mvp_win(interaction: discord.Interaction, player: discord.Member):
 # ───────────── /mvp_loss ─────────────
 @bot.tree.command(
     name="mvp_loss",
-    description="[Админ] Начислить MVP проигравшей команды (+75 ЭЛО)"
+    description="[Админ] Начислить MVP проигравшей команды (+50 ЭЛО)"
 )
 @app_commands.describe(player="Игрок, получивший MVP в проигравшей команде")
 @app_commands.default_permissions(administrator=True)
@@ -1483,12 +1483,12 @@ async def cmd_mvp_loss(interaction: discord.Interaction, player: discord.Member)
         await conn.execute(
             """
             INSERT INTO players (user_id, elo) VALUES ($1, $2)
-            ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 75
+            ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 50
             """,
-            player.id, DEFAULT_ELO + 75
+            player.id, DEFAULT_ELO + 50
         )
     await interaction.response.send_message(
-        f"🌟 **MVP проигравших!** Игрок {player.mention} получает **+75 ЭЛО**!"
+        f"🌟 **MVP проигравших!** Игрок {player.mention} получает **+50 ЭЛО**!"
     )
 
 
