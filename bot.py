@@ -42,7 +42,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 db_pool: asyncpg.Pool | None = None
 
-# Кэш настроек гильдии: guild_id → {voice_channel_id, ready_channel_id, voice_team1_id, voice_team2_id}
+# Кэш настроек гильдии: guild_id → {voice_channel_id, ready_channel_id, voice_team1_id, voice_team2_id, host_role_id}
 guild_settings_cache: dict[int, dict[str, int | None]] = {}
 
 
@@ -59,7 +59,6 @@ async def init_db() -> asyncpg.Pool:
             );
             """
         )
-        # Добавляем новые колонки для голосовых каналов команд 1 и 2
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS guild_settings (
@@ -67,15 +66,17 @@ async def init_db() -> asyncpg.Pool:
                 voice_channel_id  BIGINT,
                 ready_channel_id  BIGINT,
                 voice_team1_id    BIGINT,
-                voice_team2_id    BIGINT
+                voice_team2_id    BIGINT,
+                host_role_id      BIGINT
             );
             """
         )
         
-        # Миграция для старой базы данных (если колонки еще не существуют)
+        # Миграции для старой базы данных (если колонки еще не существуют)
         try:
             await conn.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS voice_team1_id BIGINT;")
             await conn.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS voice_team2_id BIGINT;")
+            await conn.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS host_role_id BIGINT;")
         except Exception:
             pass
 
@@ -106,10 +107,11 @@ async def load_all_guild_settings() -> None:
                 "ready_channel_id": row["ready_channel_id"],
                 "voice_team1_id": row.get("voice_team1_id"),
                 "voice_team2_id": row.get("voice_team2_id"),
+                "host_role_id": row.get("host_role_id"),
             }
 
 
-async def save_guild_setting(guild_id: int, key: str, value: int) -> None:
+async def save_guild_setting(guild_id: int, key: str, value: int | None) -> None:
     """Сохраняет одну настройку гильдии в БД и кэш."""
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -125,7 +127,8 @@ async def save_guild_setting(guild_id: int, key: str, value: int) -> None:
             "voice_channel_id": None, 
             "ready_channel_id": None,
             "voice_team1_id": None,
-            "voice_team2_id": None
+            "voice_team2_id": None,
+            "host_role_id": None
         }
     guild_settings_cache[guild_id][key] = value
 
@@ -144,6 +147,20 @@ def get_guild_voice_team1(guild_id: int) -> int | None:
 
 def get_guild_voice_team2(guild_id: int) -> int | None:
     return guild_settings_cache.get(guild_id, {}).get("voice_team2_id")
+
+
+def get_guild_host_role(guild_id: int) -> int | None:
+    return guild_settings_cache.get(guild_id, {}).get("host_role_id")
+
+
+# Проверка: имеет ли пользователь права ведущего (ведущий, админ или роль ведущего)
+def is_moderator(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    host_r_id = get_guild_host_role(member.guild.id)
+    if host_r_id:
+        return any(r.id == host_r_id for r in member.roles)
+    return False
 
 
 # ─────────────── Players ─────────────────
@@ -436,7 +453,9 @@ class ReadyButton(discord.ui.Button):
                 self.label = "Матч начат 🎮"
                 self.style = discord.ButtonStyle.secondary
                 await interaction.response.edit_message(embed=embed, view=self.view)
-                await start_match(lobby, ready_in_voice[:10])
+                
+                # Создаем предпросмотр баланса команд с кнопками управления для Ведущего
+                await prepare_match_preview(lobby, ready_in_voice[:10])
             else:
                 await interaction.response.edit_message(embed=embed, view=self.view)
 
@@ -447,18 +466,156 @@ class ReadyView(discord.ui.View):
         self.add_item(ReadyButton())
 
 
-# ═══════════════════════════ MATCH LOGIC ═════════════════════════
-async def start_match(lobby: LobbyState, players: list[discord.Member]):
-    """Формирует команды, раздаёт героев и выводит результат."""
+# ═══════════════════════ MODERATOR DECISION VIEW ═══════════════════════
+class MatchPreviewView(discord.ui.View):
+    """Панель управления с кнопками для Ведущего матча."""
+    def __init__(self, lobby: LobbyState, players: list[discord.Member], rerolls_left: int = 1):
+        super().__init__(timeout=600)  # Срок действия 10 минут
+        self.lobby = lobby
+        self.players = players
+        self.rerolls_left = rerolls_left
+
+        # Кнопка Рандом (перерандом состава) доступна, если остались попытки
+        self.random_btn = discord.ui.Button(
+            label=f"Перерандом 🎲 ({self.rerolls_left})",
+            style=discord.ButtonStyle.primary,
+            disabled=(self.rerolls_left <= 0)
+        )
+        self.random_btn.callback = self.on_reroll_click
+        self.add_item(self.random_btn)
+
+        # Кнопка подтверждения старта
+        self.start_btn = discord.ui.Button(
+            label="Старт ⚔️",
+            style=discord.ButtonStyle.success
+        )
+        self.start_btn.callback = self.on_start_click
+        self.add_item(self.start_btn)
+
+    async def on_start_click(self, interaction: discord.Interaction):
+        # Проверяем, является ли нажавший ведущим (модератором)
+        if not is_moderator(interaction.user):
+            await interaction.response.send_message(
+                "❌ Только ведущий матча (или администратор) может запустить игру.",
+                ephemeral=True
+            )
+            return
+
+        # Отключаем кнопки
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        # Переходим к финальной стадии: раздача героев, сохранение в БД и перенос по каналам
+        await finalize_and_launch_match(self.lobby, self.players)
+
+    async def on_reroll_click(self, interaction: discord.Interaction):
+        if not is_moderator(interaction.user):
+            await interaction.response.send_message(
+                "❌ Только ведущий матча (или администратор) может сделать перерандом.",
+                ephemeral=True
+            )
+            return
+
+        if self.rerolls_left <= 0:
+            await interaction.response.send_message(
+                "❌ Перерандом больше не доступен (можно использовать только 1 раз).",
+                ephemeral=True
+            )
+            return
+
+        # Уменьшаем попытки и готовим новый предпросмотр
+        self.rerolls_left -= 1
+        self.random_btn.disabled = True
+        self.random_btn.label = "Перерандом использован 🎲"
+        
+        # Обновляем сообщение с новым разделением на команды
+        await prepare_match_preview(self.lobby, self.players, self.rerolls_left, interaction)
+
+
+# ═══════════════════════════ MATCH PREVIEW ═════════════════════════
+async def prepare_match_preview(
+    lobby: LobbyState, 
+    players: list[discord.Member], 
+    rerolls_left: int = 1,
+    interaction_to_use: discord.Interaction | None = None
+):
+    """Создаёт предварительный баланс команд и отправляет его ведущему на утверждение."""
+    user_ids = [p.id for p in players]
+    elos = await get_elos_bulk(user_ids)
+    players_with_elo = [(p, elos[p.id]) for p in players]
+
+    # Балансируем в зависимости от режима
+    if lobby.match_type in ("ranked", "classic"):
+        team_a, team_b = balance_teams_snake(players_with_elo)
+    else:
+        # Chaos
+        shuffled = players_with_elo.copy()
+        random.shuffle(shuffled)
+        team_a, team_b = shuffled[:5], shuffled[5:]
+
+    total_a = sum(elo for _, elo in team_a)
+    total_b = sum(elo for _, elo in team_b)
+
+    # Строим красивый текстовый предпросмотр команд (без героев на этом этапе)
+    def build_preview_lines(team: list[tuple[discord.Member, int]]) -> str:
+        return "\n".join(f"`{i+1}.` {m.mention} — 🎖️ {elo} ЭЛО" for i, (m, elo) in enumerate(team))
+
+    preview_embed = discord.Embed(
+        title="⚖️  ПРЕДПРОСМОТР БАЛАНСА КОМАНД",
+        description=(
+            f"Режим: **{lobby.match_type.upper()}**\n"
+            f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Ведущий, проверьте состав. Вы можете сделать **один перерандом**, если баланс вас не устраивает."
+        ),
+        color=0xFEE75C
+    )
+
+    embed_a = discord.Embed(
+        title="🔵 КОМАНДА 1",
+        description=f"Суммарный ЭЛО: **{total_a}**",
+        color=EMBED_COLOR_TEAM_A
+    )
+    embed_a.add_field(name="Состав", value=build_preview_lines(team_a), inline=False)
+
+    embed_b = discord.Embed(
+        title="🔴 КОМАНДА 2",
+        description=f"Суммарный ЭЛО: **{total_b}**",
+        color=EMBED_COLOR_TEAM_B
+    )
+    embed_b.add_field(name="Состав", value=build_preview_lines(team_b), inline=False)
+
+    view = MatchPreviewView(lobby, players, rerolls_left)
+
+    if interaction_to_use:
+        # Если вызвано по кнопке перерандома, редактируем старое сообщение
+        await interaction_to_use.response.edit_message(
+            embeds=[preview_embed, embed_a, embed_b],
+            view=view
+        )
+    else:
+        # Если это первый вывод предпросмотра
+        await lobby.text_channel.send(
+            embeds=[preview_embed, embed_a, embed_b],
+            view=view
+        )
+
+
+# ═══════════════════════════ FINAL LAUNCH ═════════════════════════
+async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Member]):
+    """Финальная раздача героев, запись в БД и перемещение игроков."""
     heroes = load_heroes()
     
     user_ids = [p.id for p in players]
     elos = await get_elos_bulk(user_ids)
     players_with_elo = [(p, elos[p.id]) for p in players]
 
+    # Снова делим на команды (чтобы зафиксировать текущий состав)
     if lobby.match_type in ("ranked", "classic"):
         team_a, team_b = balance_teams_snake(players_with_elo)
     else:
+        # Chaos
         shuffled = players_with_elo.copy()
         random.shuffle(shuffled)
         team_a, team_b = shuffled[:5], shuffled[5:]
@@ -541,12 +698,9 @@ async def start_match(lobby: LobbyState, players: list[discord.Member]):
     v_team1_id = get_guild_voice_team1(guild_id)
     v_team2_id = get_guild_voice_team2(guild_id)
 
-    # Канал для Команды 1
     chan_team1 = lobby.voice_channel.guild.get_channel(v_team1_id) if v_team1_id else None
-    # Канал для Команды 2
     chan_team2 = lobby.voice_channel.guild.get_channel(v_team2_id) if v_team2_id else None
 
-    # Перемещаем игроков Команды 1
     moved_count = 0
     if chan_team1:
         for member, _, _, _ in team_a_full:
@@ -556,7 +710,6 @@ async def start_match(lobby: LobbyState, players: list[discord.Member]):
                     moved_count += 1
                 except discord.Forbidden:
                     pass
-    # Перемещаем игроков Команды 2
     if chan_team2:
         for member, _, _, _ in team_b_full:
             if member.voice and member.voice.channel:
@@ -569,18 +722,18 @@ async def start_match(lobby: LobbyState, players: list[discord.Member]):
     if moved_count > 0:
         move_notes = f"\n👉 Перемещено игроков в каналы команд: **{moved_count}** из 10."
     elif chan_team1 or chan_team2:
-        move_notes = "\n⚠️ Не удалось переместить игроков (возможно, у бота нет прав «Перемещать участников» или игроки вышли из войса)."
+        move_notes = "\n⚠️ Не удалось переместить игроков (возможно, у бота нет прав «Перемещать участников»)."
 
     header_embed = discord.Embed(
         title=match_title,
         description=(
             f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Удачи на поле боя! 🎮\n"
+            "Герои распределены по ролям. Удачи на поле боя! 🎮\n"
             "Если у вас нет выпавшего героя, напишите слэш-команду `/reroll`"
             f"{move_notes}\n\n"
             "**После игры администратор может выбрать победителя с помощью `/win_team`**" if lobby.match_type == "ranked"
-            else f"Удачи на поле боя! 🎮\nЕсли у вас нет выпавшего героя, напишите слэш-команду `/reroll`{move_notes}\n\n*(Этот матч не влияет на ЭЛО)*"
+            else f"Герои распределены. Удачи на поле боя! 🎮\nЕсли у вас нет выпавшего героя, напишите слэш-команду `/reroll`{move_notes}\n\n*(Этот матч не влияет на ЭЛО)*"
         ),
         color=0xFEE75C,
     )
@@ -744,6 +897,21 @@ async def cmd_set_voice_team2(interaction: discord.Interaction, channel: discord
     )
 
 
+# ───────────── /set_host_role ─────────────
+@bot.tree.command(
+    name="set_host_role",
+    description="[Админ] Назначить роль Ведущего матчей (может делать перерандом и запускать матчи)"
+)
+@app_commands.describe(role="Роль, члены которой будут считаться Ведущими")
+@app_commands.default_permissions(administrator=True)
+async def cmd_set_host_role(interaction: discord.Interaction, role: discord.Role):
+    await save_guild_setting(interaction.guild_id, "host_role_id", role.id)
+    await interaction.response.send_message(
+        f"✅ Роль ведущего матчей успешно установлена: **{role.name}** (`{role.id}`)",
+        ephemeral=True
+    )
+
+
 # ───────────── /settings ──────────────
 @bot.tree.command(
     name="settings",
@@ -756,11 +924,13 @@ async def cmd_settings(interaction: discord.Interaction):
     rc_id = get_guild_ready_channel(guild_id)
     vt1_id = get_guild_voice_team1(guild_id)
     vt2_id = get_guild_voice_team2(guild_id)
+    host_r_id = get_guild_host_role(guild_id)
 
     vc_text = f"<#{vc_id}>" if vc_id else "❌ _Не задан_ — используй `/set_voice`"
     rc_text = f"<#{rc_id}>" if rc_id else "❌ _Не задан_ — используй `/set_ready`"
     vt1_text = f"<#{vt1_id}>" if vt1_id else "❌ _Не задан_ — используй `/set_voice_team1`"
     vt2_text = f"<#{vt2_id}>" if vt2_id else "❌ _Не задан_ — используй `/set_voice_team2`"
+    host_text = f"<@&{host_r_id}>" if host_r_id else "❌ _Не задана_ — используй `/set_host_role`"
 
     embed = discord.Embed(
         title="⚙️  Настройки бота",
@@ -770,6 +940,7 @@ async def cmd_settings(interaction: discord.Interaction):
     embed.add_field(name="📝 Текстовый канал (лобби)", value=rc_text, inline=False)
     embed.add_field(name="🔵 Войс для Команды 1", value=vt1_text, inline=True)
     embed.add_field(name="🔴 Войс для Команды 2", value=vt2_text, inline=True)
+    embed.add_field(name="🎖️ Роль Ведущего матчей", value=host_text, inline=False)
     embed.set_footer(text="Используйте команды настройки для изменения каналов")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
