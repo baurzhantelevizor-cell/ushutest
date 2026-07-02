@@ -708,6 +708,113 @@ async def cmd_cancel(interaction: discord.Interaction):
         )
 
 
+# ───────────── /start_test ────────────
+@bot.tree.command(
+    name="start_test",
+    description="[Админ] Тестовый запуск — симулирует матч с 10 фейковыми игроками",
+)
+@app_commands.default_permissions(administrator=True)
+async def cmd_start_test(interaction: discord.Interaction):
+    """Генерирует полный вывод матча с фейковыми игроками для превью."""
+    await interaction.response.defer()
+
+    # 10 фейковых имён и случайный ЭЛО
+    fake_names = [
+        "🎮 Player_1", "🎮 Player_2", "🎮 Player_3", "🎮 Player_4",
+        "🎮 Player_5", "🎮 Player_6", "🎮 Player_7", "🎮 Player_8",
+        "🎮 Player_9", "🎮 Player_10",
+    ]
+    fake_elos = [random.randint(700, 1500) for _ in range(10)]
+
+    # Сортировка по ЭЛО и распределение змейкой
+    indexed = sorted(enumerate(fake_elos), key=lambda x: x[1], reverse=True)
+    team_a_idx: list[int] = []
+    team_b_idx: list[int] = []
+    for pick, (orig_idx, _) in enumerate(indexed):
+        if pick % 2 == 0:
+            team_a_idx.append(orig_idx)
+        else:
+            team_b_idx.append(orig_idx)
+
+    # Рандомные герои
+    heroes = load_heroes()
+    picked = pick_unique_heroes(heroes, 10)
+    random.shuffle(picked)
+
+    # Сборка команд
+    def build_test_team_lines(indices: list[int], hero_offset: int) -> tuple[str, int]:
+        lines = []
+        total = 0
+        for i, idx in enumerate(indices):
+            name = fake_names[idx]
+            elo = fake_elos[idx]
+            hero = picked[hero_offset + i]
+            total += elo
+            lines.append(
+                f"`{i+1}.` **{name}** — 🎖️ {elo} ЭЛО\n"
+                f"    🦸 Герой: **{hero}**"
+            )
+        return "\n".join(lines), total
+
+    lines_a, total_a = build_test_team_lines(team_a_idx, 0)
+    lines_b, total_b = build_test_team_lines(team_b_idx, 5)
+
+    # ── Embed: лобби (как выглядит сбор, когда все готовы) ──
+    lobby_embed = discord.Embed(
+        title="⚔️  MOBILE LEGENDS — КАСТОМНЫЙ МАТЧ 5×5",
+        description=(
+            "🔊 Голосовой канал: **Тестовый канал**\n"
+            "👥 Игроков: **10** · ✅ Готовы: **10** / 10\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        color=EMBED_COLOR_READY,
+    )
+    lobby_lines = []
+    for i in range(10):
+        lobby_lines.append(f"`{i+1:>2}.` **{fake_names[i]}** — ✅ Готов")
+    lobby_embed.add_field(
+        name="📋 Список игроков",
+        value="\n".join(lobby_lines),
+        inline=False,
+    )
+    lobby_embed.set_footer(text="🎮 Все готовы! Формирование команд...")
+
+    # ── Embed: результат матча ──
+    header_embed = discord.Embed(
+        title="🏆  МАТЧ СФОРМИРОВАН!",
+        description=(
+            f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Удачи на поле боя! 🎮"
+        ),
+        color=0xFEE75C,
+    )
+
+    embed_a = discord.Embed(
+        title="🔵 КОМАНДА 1",
+        description=f"Суммарный ЭЛО: **{total_a}**",
+        color=EMBED_COLOR_TEAM_A,
+    )
+    embed_a.add_field(name="Состав", value=lines_a, inline=False)
+
+    embed_b = discord.Embed(
+        title="🔴 КОМАНДА 2",
+        description=f"Суммарный ЭЛО: **{total_b}**",
+        color=EMBED_COLOR_TEAM_B,
+    )
+    embed_b.add_field(name="Состав", value=lines_b, inline=False)
+
+    # Отправляем оба этапа
+    await interaction.followup.send(
+        content="📋 **ТЕСТ — Так выглядит лобби когда все готовы:**",
+        embed=lobby_embed,
+    )
+    await interaction.channel.send(
+        content="⬇️ **ТЕСТ — Так выглядит результат матча:**",
+        embeds=[header_embed, embed_a, embed_b],
+    )
+
+
 # ═══════════════════════════ RUN ═════════════════════════════════
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
