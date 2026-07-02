@@ -1696,37 +1696,75 @@ async def cmd_random(interaction: discord.Interaction, role: app_commands.Choice
 )
 @app_commands.default_permissions(administrator=True)
 async def cmd_start_test(interaction: discord.Interaction):
-    """Генерирует полный вывод матча с фейковыми игроками для превью."""
-    await interaction.response.defer()
+    # Для полноценного теста сделаем так, чтобы ТЫ (тот, кто ввёл команду) был одним из игроков (Player 1)
+    # Это позволит тебе нажимать кнопку «Реролл» и видеть, как меняется твой герой!
+    caller = interaction.user
+    fake_members = [caller] + [interaction.guild.me] * 9  # Симулируем 10 участников
 
-    # 10 фейковых имён и случайный ЭЛО
-    fake_names = [
-        "🎮 Player_1", "🎮 Player_2", "🎮 Player_3", "🎮 Player_4",
-        "🎮 Player_5", "🎮 Player_6", "🎮 Player_7", "🎮 Player_8",
-        "🎮 Player_9", "🎮 Player_10",
-    ]
-    fake_elos = [random.randint(700, 1500) for _ in range(10)]
+    # Создадим фейковый LobbyState
+    class FakeLobby:
+        def __init__(self, channel, match_type="ranked"):
+            self.voice_channel = channel
+            self.text_channel = channel
+            self.match_type = match_type
+            self.finished = False
 
-    # Сортировка по ЭЛО и распределение змейкой
-    indexed = sorted(enumerate(fake_elos), key=lambda x: x[1], reverse=True)
-    team_a_idx: list[int] = []
-    team_b_idx: list[int] = []
-    for pick, (orig_idx, _) in enumerate(indexed):
-        if pick % 2 == 0:
-            team_a_idx.append(orig_idx)
-        else:
-            team_b_idx.append(orig_idx)
-
-    # Рандомные герои по ролям
+    # Записываем матч в БД так, как будто он запущен
     heroes = load_heroes()
-    role_picks = pick_unique_heroes_by_roles(heroes)
+    user_ids = [m.id for m in fake_members]
     
+    # Распределяем героев для теста
+    team_a_full = []
+    team_b_full = []
     roles_order = ["gold", "exp", "mid", "jungle", "roam"]
+    
+    # Раздаем случайных героев
+    role_picks = pick_unique_heroes_by_roles(heroes)
     role_to_heroes = {r: [] for r in roles_order}
     for h_name, role in role_picks:
         role_to_heroes[role].append(h_name)
 
-    # Сборка команд
+    # Команда 1
+    for i in range(5):
+        m = fake_members[i]
+        role = roles_order[i]
+        hero = role_to_heroes[role][0]
+        # Для фейков ЭЛО будет 1000, для тебя — твое реальное
+        elo = 1000
+        team_a_full.append((m, elo, hero, role))
+
+    # Команда 2
+    for i in range(5):
+        m = fake_members[i + 5]
+        role = roles_order[i]
+        hero = role_to_heroes[role][1]
+        elo = 1000
+        team_b_full.append((m, elo, hero, role))
+
+    # Пишем в БД под фейковым match_id
+    match_id = f"test_{int(asyncio.get_event_loop().time())}"
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", interaction.guild_id)
+        for member, elo, hero, role in team_a_full:
+            await conn.execute(
+                """
+                INSERT INTO active_match_heroes (user_id, guild_id, hero_name, role, match_id, team_name, is_ranked)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (user_id) DO UPDATE SET hero_name = $3, role = $4, match_id = $5, team_name = $6
+                """,
+                member.id, interaction.guild_id, hero, role, match_id, "Команда 1", True
+            )
+        for member, elo, hero, role in team_b_full:
+            await conn.execute(
+                """
+                INSERT INTO active_match_heroes (user_id, guild_id, hero_name, role, match_id, team_name, is_ranked)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (user_id) DO UPDATE SET hero_name = $3, role = $4, match_id = $5, team_name = $6
+                """,
+                member.id, interaction.guild_id, hero, role, match_id, "Команда 2", True
+            )
+
+    # ─── СОЗДАНИЕ EMBED'А РЕЗУЛЬТАТА ───
     role_emojis = {
         "gold": "🪙 Gold",
         "exp": "🛡️ Exp",
@@ -1735,78 +1773,71 @@ async def cmd_start_test(interaction: discord.Interaction):
         "roam": "👣 Roam"
     }
 
-    def build_test_team_lines(indices: list[int], hero_index: int) -> tuple[str, int]:
-        lines = []
-        total = 0
-        for i, idx in enumerate(indices):
-            name = fake_names[idx]
-            elo = fake_elos[idx]
-            role = roles_order[i]
-            hero = role_to_heroes[role][hero_index]
-            total += elo
+    def build_embed_team_section(team_full_list: list) -> str:
+        sec_lines = []
+        for idx, (m, elo, hero, role) in enumerate(team_full_list, start=1):
             role_label = role_emojis.get(role, role.capitalize())
-            lines.append(
-                f"`{i+1}.` **{name}** — 🎖️ {elo} ЭЛО\n"
-                f"    {role_label} · 🦸 : {hero}"
-            )
-        return "\n".join(lines), total
+            # Выводим упоминание игрока
+            sec_lines.append(f"`{idx}.` {m.mention}\n    {role_label} · 🦸 : **{hero}**")
+        return "\n".join(sec_lines)
 
-    lines_a, total_a = build_test_team_lines(team_a_idx, 0)
-    lines_b, total_b = build_test_team_lines(team_b_idx, 1)
-
-    # ── Embed: лобби (как выглядит сбор, когда все готовы) ──
-    lobby_embed = discord.Embed(
-        title="⚔️  MOBILE LEGENDS — РЕЙТИНГОВЫЙ МАТЧ 5×5",
+    result_embed = discord.Embed(
+        title="🏆 [ТЕСТ] РЕЙТИНГОВЫЙ МАТЧ СФОРМИРОВАН!",
         description=(
-            "🔊 Голосовой канал: **Тестовый канал**\n"
-            "👥 Игроков: **10** · ✅ Готовы: **10** / 10\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        ),
-        color=EMBED_COLOR_READY,
-    )
-    lobby_lines = []
-    for i in range(10):
-        lobby_lines.append(f"`{i+1:>2}.` **{fake_names[i]}** — ✅ Готов")
-    lobby_embed.add_field(
-        name="📋 Список игроков",
-        value="\n".join(lobby_lines),
-        inline=False,
-    )
-    lobby_embed.set_footer(text="🎮 Все готовы! Формирование команд...")
-
-    # ── Embed: результат матча ──
-    header_embed = discord.Embed(
-        title="🏆 РЕЙТИНГОВЫЙ МАТЧ СФОРМИРОВАН!",
-        description=(
-            f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
+            "Разница ЭЛО команд: **0**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Игроки распределены по ролям. Удачи на поле боя! 🎮"
+            "Герои распределены по ролям. Это тестовый матч.\n"
+            "Вы добавлены в **Команду 1**! Нажмите кнопку **Реролл 🎲** ниже, чтобы сменить своего героя."
         ),
         color=0xFEE75C,
     )
-
-    embed_a = discord.Embed(
-        title="🔵 КОМАНДА 1",
-        description=f"Суммарный ЭЛО: **{total_a}**",
-        color=EMBED_COLOR_TEAM_A,
+    result_embed.add_field(
+        name="🔵 КОМАНДА 1",
+        value=build_embed_team_section(team_a_full),
+        inline=False
     )
-    embed_a.add_field(name="Состав", value=lines_a, inline=False)
-
-    embed_b = discord.Embed(
-        title="🔴 КОМАНДА 2",
-        description=f"Суммарный ЭЛО: **{total_b}**",
-        color=EMBED_COLOR_TEAM_B,
+    result_embed.add_field(
+        name="🔴 КОМАНДА 2",
+        value=build_embed_team_section(team_b_full),
+        inline=False
     )
-    embed_b.add_field(name="Состав", value=lines_b, inline=False)
 
-    # Отправляем оба этапа
+    view = PlayerRerollView()
+    
+    # Также выведем Ведущему панели Reroll/Start, чтобы показать, как они выглядят
+    # (в качестве фейковых команд)
+    preview_team_a = [(m, elo) for m, elo, _, _ in team_a_full]
+    preview_team_b = [(m, elo) for m, elo, _, _ in team_b_full]
+    
+    preview_embed = discord.Embed(
+        title="⚖️  [ТЕСТ] ПРЕДПРОСМОТР БАЛАНСА КОМАНД",
+        description=(
+            "Режим: **RANKED**\n"
+            "Разница ЭЛО команд: **0**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Ведущий, проверьте состав. Вы можете сделать **один перерандом**."
+        ),
+        color=0xFEE75C
+    )
+    embed_a = discord.Embed(title="🔵 КОМАНДА 1", description="Суммарный ЭЛО: **1000**", color=EMBED_COLOR_TEAM_A)
+    embed_a.add_field(name="Состав", value="\n".join(f"`{i+1}.` {m.mention} — 🎖️ 1000 ЭЛО" for i, (m, _) in enumerate(preview_team_a)), inline=False)
+    
+    embed_b = discord.Embed(title="🔴 КОМАНДА 2", description="Суммарный ЭЛО: **1000**", color=EMBED_COLOR_TEAM_B)
+    embed_b.add_field(name="Состав", value="\n".join(f"`{i+1}.` {m.mention} — 🎖️ 1000 ЭЛО" for i, (m, _) in enumerate(preview_team_b)), inline=False)
+
+    fake_lobby_obj = FakeLobby(interaction.channel)
+    preview_view = MatchPreviewView(fake_lobby_obj, fake_members, preview_team_a, preview_team_b, 1)
+
     await interaction.followup.send(
-        content="📋 **ТЕСТ — Так выглядит лобби когда все готовы:**",
-        embed=lobby_embed,
+        content="⬇️ **[ТЕСТ] Так выглядит панель Ведущего для перерандома и старта:**",
+        embeds=[preview_embed, embed_a, embed_b],
+        view=preview_view
     )
+
     await interaction.channel.send(
-        content="⬇️ **ТЕСТ — Так выглядит результат матча:**",
-        embeds=[header_embed, embed_a, embed_b],
+        content=f"⬇️ **[ТЕСТ] Так выглядит финальный Embed с героями и кнопкой замены:**",
+        embed=result_embed,
+        view=view
     )
 
 
