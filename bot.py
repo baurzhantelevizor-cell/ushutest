@@ -326,7 +326,7 @@ def build_result_embed(
         role_label = role_emojis.get(role, role.capitalize())
         lines.append(
             f"`{idx}.` {member.mention} — 🎖️ {elo} ЭЛО\n"
-            f"    Роль: **{role_label}** · 🦸 Герой: **{hero}**"
+            f"    {role_label} · 🦸 : {hero}"
         )
 
     embed.add_field(
@@ -1055,7 +1055,7 @@ async def cmd_start_test(interaction: discord.Interaction):
             role_label = role_emojis.get(role, role.capitalize())
             lines.append(
                 f"`{i+1}.` **{name}** — 🎖️ {elo} ЭЛО\n"
-                f"    Роль: **{role_label}** · 🦸 Герой: **{hero}**"
+                f"    {role_label} · 🦸 : {hero}"
             )
         return "\n".join(lines), total
 
@@ -1115,6 +1115,26 @@ async def cmd_start_test(interaction: discord.Interaction):
     await interaction.channel.send(
         content="⬇️ **ТЕСТ — Так выглядит результат матча:**",
         embeds=[header_embed, embed_a, embed_b],
+    )
+
+
+# ───────────── /random ────────────────
+@bot.tree.command(
+    name="random",
+    description="Случайное число от 1 до указанного максимума (по дефолту 100)"
+)
+@app_commands.describe(max_val="Максимальное значение для генерации (по умолчанию 100)")
+async def cmd_random(interaction: discord.Interaction, max_val: int = 100):
+    if max_val < 1:
+        await interaction.response.send_message(
+            "❌ Максимальное значение должно быть не меньше 1.",
+            ephemeral=True
+        )
+        return
+        
+    rolled_num = random.randint(1, max_val)
+    await interaction.response.send_message(
+        f"🎲 {interaction.user.mention} крутит рандомайзер (1-{max_val}) и выбивает: **{rolled_num}**"
     )
 
 
