@@ -311,7 +311,7 @@ def build_lobby_embed(
             status = "✅ Готов"
         else:
             status = "⏳ Ожидание"
-        lines.append(f"`{idx:>2}.` **{member.display_name}** — {status}")
+        lines.append(f"`{idx:>2}.` {member.mention} — {status}")
 
     embed.add_field(
         name="📋 Список игроков",
