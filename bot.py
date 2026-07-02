@@ -1024,6 +1024,10 @@ class AutoWinPollView(discord.ui.View):
                 return
 
             if is_ranked_match:
+                winners_ids = [p["user_id"] for p in players if p["team_name"] == winner_team_val]
+                losers_ids = [p["user_id"] for p in players if p["team_name"] != winner_team_val]
+
+                # Победителям +50 ЭЛО
                 for uid in winners_ids:
                     await conn.execute(
                         """
@@ -1033,16 +1037,28 @@ class AutoWinPollView(discord.ui.View):
                         uid, DEFAULT_ELO + 50
                     )
                 
+                # Проигравшим -50 ЭЛО (но не ниже 0)
+                for uid in losers_ids:
+                    await conn.execute(
+                        """
+                        INSERT INTO players (user_id, elo) VALUES ($1, $2)
+                        ON CONFLICT (user_id) DO UPDATE SET elo = GREATEST(players.elo - 50, 0)
+                        """,
+                        uid, DEFAULT_ELO - 50
+                    )
+
                 await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", self.guild_id)
-                mentions = " ".join(f"<@{uid}>" for uid in winners_ids)
+                mentions_win = " ".join(f"<@{uid}>" for uid in winners_ids)
+                mentions_loss = " ".join(f"<@{uid}>" for uid in losers_ids)
                 await interaction.followup.send(
                     f"🎉 **Команда {winner_team_val} побеждает в рейтинговом матче!**\n"
-                    f"Все участники команды получают **+50 ЭЛО**:\n{mentions}"
+                    f"🟢 Победители получает **+50 ЭЛО**:\n{mentions_win}\n"
+                    f"🔴 Проигравшие теряют **-50 ЭЛО**:\n{mentions_loss}"
                 )
             else:
                 await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", self.guild_id)
                 await interaction.followup.send(
-                    f"🎉 **Команда {winner_team_val} побеждает!**\n*(Этот матч был не рейтинговым, ЭЛО начислено не было)*"
+                    f"🎉 **Команда {winner_team_val} побеждает!**\n*(Этот матч был не рейтинговым, ЭЛО изменено не было)*"
                 )
 
     @discord.ui.button(label="🔵 Команда 1", style=discord.ButtonStyle.primary)
@@ -1648,6 +1664,10 @@ async def cmd_win_team(interaction: discord.Interaction, team: app_commands.Choi
             return
 
         if is_ranked_match:
+            winners_ids = [p["user_id"] for p in players if p["team_name"] == winner_team_val]
+            losers_ids = [p["user_id"] for p in players if p["team_name"] != winner_team_val]
+
+            # Победителям +50 ЭЛО
             for uid in winners_ids:
                 await conn.execute(
                     """
@@ -1657,24 +1677,36 @@ async def cmd_win_team(interaction: discord.Interaction, team: app_commands.Choi
                     uid, DEFAULT_ELO + 50
                 )
             
+            # Проигравшим -50 ЭЛО (но не ниже 0)
+            for uid in losers_ids:
+                await conn.execute(
+                    """
+                    INSERT INTO players (user_id, elo) VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO UPDATE SET elo = GREATEST(players.elo - 50, 0)
+                    """,
+                    uid, DEFAULT_ELO - 50
+                )
+            
             await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", guild_id)
 
-            mentions = " ".join(f"<@{uid}>" for uid in winners_ids)
+            mentions_win = " ".join(f"<@{uid}>" for uid in winners_ids)
+            mentions_loss = " ".join(f"<@{uid}>" for uid in losers_ids)
             await interaction.response.send_message(
                 f"🎉 **Команда {team.name} побеждает в рейтинговом матче!**\n"
-                f"Все участники команды получают **+50 ЭЛО**:\n{mentions}"
+                f"🟢 Победители получают **+50 ЭЛО**:\n{mentions_win}\n"
+                f"🔴 Проигравшие теряют **-50 ЭЛО**:\n{mentions_loss}"
             )
         else:
             await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", guild_id)
             await interaction.response.send_message(
-                f"🎉 **Команда {team.name} побеждает!**\n*(Этот матч был не рейтинговым, ЭЛО начислено не было)*"
+                f"🎉 **Команда {team.name} побеждает!**\n*(Этот матч был не рейтинговым, ЭЛО изменено не было)*"
             )
 
 
 # ───────────── /mvp_win ──────────────
 @bot.tree.command(
     name="mvp_win",
-    description="[Админ] Начислить MVP победившей команды (+75 ЭЛО)"
+    description="[Админ] Начислить MVP победившей команды (+25 ЭЛО)"
 )
 @app_commands.describe(player="Игрок, получивший MVP в победившей команде")
 @app_commands.default_permissions(administrator=True)
@@ -1683,19 +1715,19 @@ async def cmd_mvp_win(interaction: discord.Interaction, player: discord.Member):
         await conn.execute(
             """
             INSERT INTO players (user_id, elo) VALUES ($1, $2)
-            ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 75
+            ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 25
             """,
-            player.id, DEFAULT_ELO + 75
+            player.id, DEFAULT_ELO + 25
         )
     await interaction.response.send_message(
-        f"🌟 **MVP победителей!** Игрок {player.mention} получает **+75 ЭЛО**!"
+        f"🌟 **MVP победителей!** Игрок {player.mention} получает **+25 ЭЛО**!"
     )
 
 
 # ───────────── /mvp_loss ─────────────
 @bot.tree.command(
     name="mvp_loss",
-    description="[Админ] Начислить MVP проигравшей команды (+50 ЭЛО)"
+    description="[Админ] Начислить MVP проигравшей команды (+25 ЭЛО)"
 )
 @app_commands.describe(player="Игрок, получивший MVP в проигравшей команде")
 @app_commands.default_permissions(administrator=True)
@@ -1704,12 +1736,12 @@ async def cmd_mvp_loss(interaction: discord.Interaction, player: discord.Member)
         await conn.execute(
             """
             INSERT INTO players (user_id, elo) VALUES ($1, $2)
-            ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 50
+            ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 25
             """,
-            player.id, DEFAULT_ELO + 50
+            player.id, DEFAULT_ELO + 25
         )
     await interaction.response.send_message(
-        f"🌟 **MVP проигравших!** Игрок {player.mention} получает **+50 ЭЛО**!"
+        f"🌟 **MVP проигравших!** Игрок {player.mention} получает **+25 ЭЛО**!"
     )
 
 
