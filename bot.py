@@ -70,6 +70,7 @@ async def init_db() -> asyncpg.Pool:
             """
         )
         # Таблица для хранения выданных игрокам героев в текущих матчах
+        # Добавлен столбец team_name для легкого определения команды игрока (Команда 1 / Команда 2)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS active_match_heroes (
@@ -77,7 +78,8 @@ async def init_db() -> asyncpg.Pool:
                 guild_id  BIGINT NOT NULL,
                 hero_name VARCHAR(100) NOT NULL,
                 role      VARCHAR(50) NOT NULL,
-                match_id  VARCHAR(100) NOT NULL
+                match_id  VARCHAR(100) NOT NULL,
+                team_name VARCHAR(50) NOT NULL DEFAULT 'Команда 1'
             );
             """
         )
@@ -362,7 +364,7 @@ class LobbyState:
         self.finished = False
 
 
-# Активные лобби: voice_channel_id → LobbyState
+# Active lobbies: voice_channel_id → LobbyState
 active_lobbies: dict[int, LobbyState] = {}
 
 
@@ -477,20 +479,28 @@ async def start_match(lobby: LobbyState, players: list[discord.Member]):
     total_a = sum(elo for _, elo, _, _ in team_a_full)
     total_b = sum(elo for _, elo, _, _ in team_b_full)
 
-    # Сохраняем выданных героев в БД для возможности крутки (reroll)
+    # Сохраняем выданных героев в БД для возможности крутки (reroll) и выбора победителя
     match_id = f"{lobby.voice_channel.id}_{int(asyncio.get_event_loop().time())}"
     async with db_pool.acquire() as conn:
         # Сначала очистим старые записи для этой гильдии
         await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", lobby.voice_channel.guild.id)
         
-        # Сохраняем новых
-        for member, elo, hero, role in team_a_full + team_b_full:
+        # Сохраняем новых (записываем также название команды 'Команда 1' / 'Команда 2')
+        for member, elo, hero, role in team_a_full:
             await conn.execute(
                 """
-                INSERT INTO active_match_heroes (user_id, guild_id, hero_name, role, match_id)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO active_match_heroes (user_id, guild_id, hero_name, role, match_id, team_name)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 """,
-                member.id, lobby.voice_channel.guild.id, hero, role, match_id
+                member.id, lobby.voice_channel.guild.id, hero, role, match_id, "Команда 1"
+            )
+        for member, elo, hero, role in team_b_full:
+            await conn.execute(
+                """
+                INSERT INTO active_match_heroes (user_id, guild_id, hero_name, role, match_id, team_name)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                member.id, lobby.voice_channel.guild.id, hero, role, match_id, "Команда 2"
             )
 
     embed_a = build_result_embed(team_a_full, "🔵 КОМАНДА 1", EMBED_COLOR_TEAM_A, total_a)
@@ -504,7 +514,8 @@ async def start_match(lobby: LobbyState, players: list[discord.Member]):
             f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "Игроки распределены по ролям. Удачи на поле боя! 🎮\n"
-            "Если у вас нет выпавшего героя, напишите слэш-команду `/reroll`"
+            "Если у вас нет выпавшего героя, напишите слэш-команду `/reroll`\n\n"
+            "**После игры администратор может выбрать победителя с помощью `/win_team`**"
         ),
         color=0xFEE75C,
     )
@@ -879,6 +890,111 @@ async def cmd_reroll(interaction: discord.Interaction):
             f"Старый герой: ~~{current_hero}~~\n"
             f"Новый герой: **{new_hero}**"
         )
+
+
+# ───────────── /win_team ──────────────
+@bot.tree.command(
+    name="win_team",
+    description="[Админ] Начислить ЭЛО победившей команде (+50 ЭЛО каждому)"
+)
+@app_commands.describe(team="Выберите победившую команду")
+@app_commands.choices(team=[
+    app_commands.Choice(name="🔵 КОМАНДА 1", value="Команда 1"),
+    app_commands.Choice(name="🔴 КОМАНДА 2", value="Команда 2")
+])
+@app_commands.default_permissions(administrator=True)
+async def cmd_win_team(interaction: discord.Interaction, team: app_commands.Choice[str]):
+    guild_id = interaction.guild_id
+    winner_team_val = team.value
+
+    async with db_pool.acquire() as conn:
+        # Достаем участников этого матча в гильдии
+        players = await conn.fetch(
+            """
+            SELECT user_id, team_name 
+            FROM active_match_heroes 
+            WHERE guild_id = $1
+            """,
+            guild_id
+        )
+
+        if not players or len(players) < 10:
+            await interaction.response.send_message(
+                "❌ На сервере нет активных матчей или состав неполный.",
+                ephemeral=True
+            )
+            return
+
+        winners_ids = [p["user_id"] for p in players if p["team_name"] == winner_team_val]
+
+        if not winners_ids:
+            await interaction.response.send_message(
+                "❌ Не удалось определить игроков победившей команды.",
+                ephemeral=True
+            )
+            return
+
+        # Начисляем победителям по 50 ЭЛО
+        for uid in winners_ids:
+            # Сначала убедимся, что игрок есть в бд (upsert)
+            await conn.execute(
+                """
+                INSERT INTO players (user_id, elo) VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 50
+                """,
+                uid, DEFAULT_ELO + 50
+            )
+
+        # Очищаем активный матч, так как игра завершилась
+        await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", guild_id)
+
+        mentions = " ".join(f"<@{uid}>" for uid in winners_ids)
+        await interaction.response.send_message(
+            f"🎉 **Команда {team.name} побеждает!**\n"
+            f"Все участники команды получают **+50 ЭЛО**:\n{mentions}"
+        )
+
+
+# ───────────── /mvp_win ──────────────
+@bot.tree.command(
+    name="mvp_win",
+    description="[Админ] Начислить MVP победившей команды (+75 ЭЛО)"
+)
+@app_commands.describe(player="Игрок, получивший MVP в победившей команде")
+@app_commands.default_permissions(administrator=True)
+async def cmd_mvp_win(interaction: discord.Interaction, player: discord.Member):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO players (user_id, elo) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 75
+            """,
+            player.id, DEFAULT_ELO + 75
+        )
+    await interaction.response.send_message(
+        f"🌟 **MVP победителей!** Игрок {player.mention} получает **+75 ЭЛО**!"
+    )
+
+
+# ───────────── /mvp_loss ─────────────
+@bot.tree.command(
+    name="mvp_loss",
+    description="[Админ] Начислить MVP проигравшей команды (+75 ЭЛО)"
+)
+@app_commands.describe(player="Игрок, получивший MVP в проигравшей команде")
+@app_commands.default_permissions(administrator=True)
+async def cmd_mvp_loss(interaction: discord.Interaction, player: discord.Member):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO players (user_id, elo) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 75
+            """,
+            player.id, DEFAULT_ELO + 75
+        )
+    await interaction.response.send_message(
+        f"🌟 **MVP проигравших!** Игрок {player.mention} получает **+75 ЭЛО**!"
+    )
 
 
 # ───────────── /start_test ────────────
