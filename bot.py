@@ -1393,6 +1393,50 @@ async def cmd_elo(interaction: discord.Interaction):
     )
 
 
+# ───────────── /top ───────────────────
+@bot.tree.command(name="top", description="Посмотреть топ-10 игроков сервера по ЭЛО")
+async def cmd_top(interaction: discord.Interaction):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, elo FROM players ORDER BY elo DESC LIMIT 10"
+        )
+
+    if not rows:
+        await interaction.response.send_message(
+            "❌ В базе данных пока нет игроков с рейтингом.", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="🏆 ТОП-10 ИГРОКОВ ПО ЭЛО",
+        description="Рейтинг сильнейших игроков сервера:",
+        color=0xFEE75C
+    )
+
+    medal_emojis = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+    leaderboard_lines = []
+    for idx, row in enumerate(rows, start=1):
+        u_id = row["user_id"]
+        elo_val = row["elo"]
+        
+        # Получаем пользователя в кэше сервера или через API
+        member = interaction.guild.get_member(u_id)
+        name = member.mention if member else f"Участник <@{u_id}>"
+        
+        medal = medal_emojis.get(idx, f"`{idx:>2}.` ")
+        leaderboard_lines.append(f"{medal} {name} — **{elo_val}** ЭЛО")
+
+    embed.add_field(
+        name="📋 Таблица лидеров",
+        value="\n".join(leaderboard_lines),
+        inline=False
+    )
+    embed.set_footer(text="Играйте рейтинговые матчи, чтобы подняться выше!")
+
+    await interaction.response.send_message(embed=embed)
+
+
 # ───────────── /cancel ────────────────
 @bot.tree.command(name="cancel", description="Отменить текущий сбор на матч")
 @app_commands.default_permissions(administrator=True)
