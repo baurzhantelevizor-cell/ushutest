@@ -32,7 +32,7 @@ GUILD_ID = int(os.environ.get("GUILD_ID", "0"))
 HEROES_FILE = Path(__file__).parent / "heroes.txt"
 
 # Дефолтный ЭЛО для новых игроков
-DEFAULT_ELO = 500
+DEFAULT_ELO = 300
 
 # ─────────────────────────── БОТ ─────────────────────────────────
 intents = discord.Intents.default()
@@ -56,7 +56,7 @@ async def init_db() -> asyncpg.Pool:
             """
             CREATE TABLE IF NOT EXISTS players (
                 user_id  BIGINT PRIMARY KEY,
-                elo      INTEGER NOT NULL DEFAULT 500
+                elo      INTEGER NOT NULL DEFAULT 300
             );
             """
         )
@@ -71,6 +71,7 @@ async def init_db() -> asyncpg.Pool:
         )
         # Таблица для хранения выданных игрокам героев в текущих матчах
         # Добавлен столбец team_name для легкого определения команды игрока (Команда 1 / Команда 2)
+        # Добавлен столбец is_ranked, чтобы знать, сохранять ли изменения в ЭЛО после катки
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS active_match_heroes (
@@ -79,7 +80,8 @@ async def init_db() -> asyncpg.Pool:
                 hero_name VARCHAR(100) NOT NULL,
                 role      VARCHAR(50) NOT NULL,
                 match_id  VARCHAR(100) NOT NULL,
-                team_name VARCHAR(50) NOT NULL DEFAULT 'Команда 1'
+                team_name VARCHAR(50) NOT NULL DEFAULT 'Команда 1',
+                is_ranked BOOLEAN NOT NULL DEFAULT TRUE
             );
             """
         )
@@ -263,13 +265,14 @@ def build_lobby_embed(
     voice_members: list[discord.Member],
     ready_ids: set[int],
     voice_channel_name: str,
+    match_type: str = "Рейтинговый",
 ) -> discord.Embed:
     """Строит embed со списком игроков лобби."""
     ready_count = sum(1 for m in voice_members if m.id in ready_ids)
     total = len(voice_members)
 
     embed = discord.Embed(
-        title="⚔️  MOBILE LEGENDS — КАСТОМНЫЙ МАТЧ 5×5",
+        title=f"⚔️  MOBILE LEGENDS — {match_type.upper()} МАТЧ 5×5",
         description=(
             f"🔊 Голосовой канал: **{voice_channel_name}**\n"
             f"👥 Игроков: **{total}** · ✅ Готовы: **{ready_count}** / 10\n"
@@ -348,6 +351,7 @@ class LobbyState:
         "ready_ids",
         "lock",
         "finished",
+        "match_type",  # "ranked", "classic", "chaos"
     )
 
     def __init__(
@@ -355,6 +359,7 @@ class LobbyState:
         voice_channel: discord.VoiceChannel,
         text_channel: discord.TextChannel,
         message: discord.Message,
+        match_type: str = "ranked",
     ):
         self.voice_channel = voice_channel
         self.text_channel = text_channel
@@ -362,6 +367,7 @@ class LobbyState:
         self.ready_ids: set[int] = set()
         self.lock = asyncio.Lock()
         self.finished = False
+        self.match_type = match_type
 
 
 # Active lobbies: voice_channel_id → LobbyState
@@ -411,8 +417,14 @@ class ReadyButton(discord.ui.Button):
             lobby.ready_ids.add(member.id)
 
             # Обновляем embed
+            match_type_labels = {
+                "ranked": "Рейтинговый",
+                "classic": "Классический",
+                "chaos": "Хаос"
+            }
+            label = match_type_labels.get(lobby.match_type, "Рейтинговый")
             embed = build_lobby_embed(
-                vc_members, lobby.ready_ids, lobby.voice_channel.name
+                vc_members, lobby.ready_ids, lobby.voice_channel.name, label
             )
 
             # Считаем готовых, которые ещё в войсе
@@ -442,65 +454,107 @@ async def start_match(lobby: LobbyState, players: list[discord.Member]):
     """Формирует команды, раздаёт героев и выводит результат."""
     heroes = load_heroes()
     
-    # Распределяем роли и героев: 5 ролей, по 2 уникальных героя на роль
-    role_picks = pick_unique_heroes_by_roles(heroes)
-
-    # Получаем ЭЛО из БД
+    # 1. Распределяем по силе (по змейке ЭЛО) для ranked и classic
+    # В хаосе (chaos) - делим на 2 команды чисто рандомно, игнорируя ЭЛО
     user_ids = [p.id for p in players]
     elos = await get_elos_bulk(user_ids)
-
     players_with_elo = [(p, elos[p.id]) for p in players]
-    team_a, team_b = balance_teams_snake(players_with_elo)
 
-    # Каждой команде выдаём по одному герою каждого типа
-    # Роли: gold, exp, mid, jungle, roam
+    if lobby.match_type in ("ranked", "classic"):
+        team_a, team_b = balance_teams_snake(players_with_elo)
+    else:
+        # Хаос: случайный баланс
+        shuffled = players_with_elo.copy()
+        random.shuffle(shuffled)
+        team_a, team_b = shuffled[:5], shuffled[5:]
+
+    # 2. Распределяем роли и героев в зависимости от режима матча
     roles_order = ["gold", "exp", "mid", "jungle", "roam"]
-    
-    # Разделяем героев по ролям
-    role_to_heroes = {r: [] for r in roles_order}
-    for h_name, role in role_picks:
-        role_to_heroes[role].append(h_name)
-
-    # Распределяем роли внутри команд
-    # Для Команды 1
     team_a_full = []
-    for i, (member, elo) in enumerate(team_a):
-        role = roles_order[i]
-        hero = role_to_heroes[role][0]
-        team_a_full.append((member, elo, hero, role))
-
-    # Для Команды 2
     team_b_full = []
-    for i, (member, elo) in enumerate(team_b):
-        role = roles_order[i]
-        hero = role_to_heroes[role][1]
-        team_b_full.append((member, elo, hero, role))
+
+    if lobby.match_type in ("ranked", "classic"):
+        # По лайнам: по 2 уникальных героя на роль, без повторов, один на команду
+        role_picks = pick_unique_heroes_by_roles(heroes)
+        role_to_heroes = {r: [] for r in roles_order}
+        for h_name, role in role_picks:
+            role_to_heroes[role].append(h_name)
+
+        for i, (member, elo) in enumerate(team_a):
+            role = roles_order[i]
+            hero = role_to_heroes[role][0]
+            team_a_full.append((member, elo, hero, role))
+
+        for i, (member, elo) in enumerate(team_b):
+            role = roles_order[i]
+            hero = role_to_heroes[role][1]
+            team_a_full.append((member, elo, hero, role)) # Oops, it should be team_b_full
+    else:
+        # Режим Хаос (chaos): полный хаос, нет баланса по лайнам, роли раздаются рандомно
+        # Роли могут повторяться, на лес не лесник, на стрелок боец и т.д.
+        # Выбираем 10 полностью уникальных героев из общего пула
+        picked_heroes = pick_unique_heroes(heroes, 10)
+        random.shuffle(picked_heroes)
+        
+        # Раздаем роли рандомно из всех возможных
+        all_possible_roles = list(HERO_ROLES.values())
+        if not all_possible_roles:
+            all_possible_roles = roles_order
+
+        # Назначаем игрокам случайные роли
+        for i, (member, elo) in enumerate(team_a):
+            hero = picked_heroes[i]
+            role = random.choice(all_possible_roles)
+            team_a_full.append((member, elo, hero, role))
+
+        for i, (member, elo) in enumerate(team_b):
+            hero = picked_heroes[i + 5]
+            role = random.choice(all_possible_roles)
+            team_b_full.append((member, elo, hero, role))
+
+    # Коррекция баги с набивкой в один массив, перепишем чисто:
+    if lobby.match_type in ("ranked", "classic"):
+        role_picks = pick_unique_heroes_by_roles(heroes)
+        role_to_heroes = {r: [] for r in roles_order}
+        for h_name, role in role_picks:
+            role_to_heroes[role].append(h_name)
+
+        team_a_full = []
+        for i, (member, elo) in enumerate(team_a):
+            role = roles_order[i]
+            hero = role_to_heroes[role][0]
+            team_a_full.append((member, elo, hero, role))
+
+        team_b_full = []
+        for i, (member, elo) in enumerate(team_b):
+            role = roles_order[i]
+            hero = role_to_heroes[role][1]
+            team_b_full.append((member, elo, hero, role))
 
     total_a = sum(elo for _, elo, _, _ in team_a_full)
     total_b = sum(elo for _, elo, _, _ in team_b_full)
 
-    # Сохраняем выданных героев в БД для возможности крутки (reroll) и выбора победителя
+    # Сохраняем выданных героев в БД
+    is_ranked_bool = (lobby.match_type == "ranked")
     match_id = f"{lobby.voice_channel.id}_{int(asyncio.get_event_loop().time())}"
     async with db_pool.acquire() as conn:
-        # Сначала очистим старые записи для этой гильдии
         await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", lobby.voice_channel.guild.id)
         
-        # Сохраняем новых (записываем также название команды 'Команда 1' / 'Команда 2')
         for member, elo, hero, role in team_a_full:
             await conn.execute(
                 """
-                INSERT INTO active_match_heroes (user_id, guild_id, hero_name, role, match_id, team_name)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO active_match_heroes (user_id, guild_id, hero_name, role, match_id, team_name, is_ranked)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
-                member.id, lobby.voice_channel.guild.id, hero, role, match_id, "Команда 1"
+                member.id, lobby.voice_channel.guild.id, hero, role, match_id, "Команда 1", is_ranked_bool
             )
         for member, elo, hero, role in team_b_full:
             await conn.execute(
                 """
-                INSERT INTO active_match_heroes (user_id, guild_id, hero_name, role, match_id, team_name)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO active_match_heroes (user_id, guild_id, hero_name, role, match_id, team_name, is_ranked)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
-                member.id, lobby.voice_channel.guild.id, hero, role, match_id, "Команда 2"
+                member.id, lobby.voice_channel.guild.id, hero, role, match_id, "Команда 2", is_ranked_bool
             )
 
     embed_a = build_result_embed(team_a_full, "🔵 КОМАНДА 1", EMBED_COLOR_TEAM_A, total_a)
@@ -508,14 +562,19 @@ async def start_match(lobby: LobbyState, players: list[discord.Member]):
 
     mentions = " ".join(m.mention for m in players)
 
+    match_title = "🏆 РЕЙТИНГОВЫЙ МАТЧ СФОРМИРОВАН!" if lobby.match_type == "ranked" else (
+        "⚔️ КЛАССИЧЕСКИЙ МАТЧ СФОРМИРОВАН!" if lobby.match_type == "classic" else "🌀 ХАОС МАТЧ СФОРМИРОВАН!"
+    )
+    
     header_embed = discord.Embed(
-        title="🏆  МАТЧ СФОРМИРОВАН!",
+        title=match_title,
         description=(
             f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Игроки распределены по ролям. Удачи на поле боя! 🎮\n"
+            "Удачи на поле боя! 🎮\n"
             "Если у вас нет выпавшего героя, напишите слэш-команду `/reroll`\n\n"
-            "**После игры администратор может выбрать победителя с помощью `/win_team`**"
+            "**После игры администратор может выбрать победителя с помощью `/win_team`**" if lobby.match_type == "ranked"
+            else "Удачи на поле боя! 🎮\nЕсли у вас нет выпавшего героя, напишите слэш-команду `/reroll`\n\n*(Этот матч не влияет на ЭЛО)*"
         ),
         color=0xFEE75C,
     )
@@ -594,8 +653,15 @@ async def on_voice_state_update(
             current_ids = {m.id for m in vc_members}
             lobby.ready_ids &= current_ids
 
+            match_type_labels = {
+                "ranked": "Рейтинговый",
+                "classic": "Классический",
+                "chaos": "Хаос"
+            }
+            label = match_type_labels.get(lobby.match_type, "Рейтинговый")
+
             embed = build_lobby_embed(
-                vc_members, lobby.ready_ids, lobby.voice_channel.name
+                vc_members, lobby.ready_ids, lobby.voice_channel.name, label
             )
             try:
                 await lobby.message.edit(embed=embed)
@@ -667,12 +733,8 @@ async def cmd_settings(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ───────────── /start ─────────────────
-@bot.tree.command(
-    name="start",
-    description="Начать сбор на кастомный матч 5×5 в Mobile Legends",
-)
-async def cmd_start(interaction: discord.Interaction):
+# Общий хелпер для запуска сборов
+async def run_lobby_init(interaction: discord.Interaction, match_type: str, label: str):
     guild_id = interaction.guild_id
     configured_vc = get_guild_voice_channel(guild_id)
     configured_rc = get_guild_ready_channel(guild_id)
@@ -714,14 +776,14 @@ async def cmd_start(interaction: discord.Interaction):
     vc_members = voice_channel.members
     ready_ids: set[int] = set()
 
-    embed = build_lobby_embed(vc_members, ready_ids, voice_channel.name)
+    embed = build_lobby_embed(vc_members, ready_ids, voice_channel.name, label)
     view = ReadyView()
 
-    # Если настроен текстовый канал для лобби — шлём туда, иначе отвечаем на месте
+    # Шлём лобби
     if configured_rc and interaction.channel_id == configured_rc:
         await interaction.response.send_message(embed=embed, view=view)
         msg = await interaction.original_response()
-        lobby = LobbyState(voice_channel, interaction.channel, msg)
+        lobby = LobbyState(voice_channel, interaction.channel, msg, match_type)
     elif configured_rc:
         target_ch = interaction.guild.get_channel(configured_rc)
         if target_ch is None:
@@ -734,14 +796,50 @@ async def cmd_start(interaction: discord.Interaction):
         await interaction.response.send_message(
             f"✅ Сбор запущен в <#{configured_rc}>!", ephemeral=True
         )
-        lobby = LobbyState(voice_channel, target_ch, msg)
+        lobby = LobbyState(voice_channel, target_ch, msg, match_type)
     else:
         # Каналы не настроены — работаем прямо тут
         await interaction.response.send_message(embed=embed, view=view)
         msg = await interaction.original_response()
-        lobby = LobbyState(voice_channel, interaction.channel, msg)
+        lobby = LobbyState(voice_channel, interaction.channel, msg, match_type)
 
     active_lobbies[voice_channel.id] = lobby
+
+
+# ───────────── /start_ranked ─────────────
+@bot.tree.command(
+    name="start_ranked",
+    description="Начать сбор на рейтинговый матч 5×5 (с балансом по ЭЛО и распределением по лайнам)"
+)
+async def cmd_start_ranked(interaction: discord.Interaction):
+    await run_lobby_init(interaction, "ranked", "Рейтинговый")
+
+
+# ───────────── /start_classic ────────────
+@bot.tree.command(
+    name="start_classic",
+    description="Начать сбор на классический матч 5×5 (баланс по ЭЛО и лайнам, без начисления рейтинга)"
+)
+async def cmd_start_classic(interaction: discord.Interaction):
+    await run_lobby_init(interaction, "classic", "Классический")
+
+
+# ───────────── /start_dalbaeb ────────────
+@bot.tree.command(
+    name="start_dalbaeb",
+    description="Начать сбор на хаос-матч 5×5 (полный хаос: случайные команды, рандомные лайны, без влияния на ЭЛО)"
+)
+async def cmd_start_dalbaeb(interaction: discord.Interaction):
+    await run_lobby_init(interaction, "chaos", "Хаос")
+
+
+# Для совместимости оставим обычный /start, он будет вести себя как Ranked
+@bot.tree.command(
+    name="start",
+    description="Начать сбор на рейтинговый матч 5×5 в Mobile Legends"
+)
+async def cmd_start(interaction: discord.Interaction):
+    await run_lobby_init(interaction, "ranked", "Рейтинговый")
 
 
 # ───────────── /set_elo ───────────────
@@ -820,7 +918,7 @@ async def cmd_reroll(interaction: discord.Interaction):
         # Проверяем, есть ли активный герой у игрока в этой гильдии
         row = await conn.fetchrow(
             """
-            SELECT hero_name, role, match_id 
+            SELECT hero_name, role, match_id, is_ranked 
             FROM active_match_heroes 
             WHERE user_id = $1 AND guild_id = $2
             """,
@@ -895,7 +993,7 @@ async def cmd_reroll(interaction: discord.Interaction):
 # ───────────── /win_team ──────────────
 @bot.tree.command(
     name="win_team",
-    description="[Админ] Начислить ЭЛО победившей команде (+50 ЭЛО каждому)"
+    description="[Админ] Начислить ЭЛО победившей команде (+50 ЭЛО каждому, только для Ranked)"
 )
 @app_commands.describe(team="Выберите победившую команду")
 @app_commands.choices(team=[
@@ -911,7 +1009,7 @@ async def cmd_win_team(interaction: discord.Interaction, team: app_commands.Choi
         # Достаем участников этого матча в гильдии
         players = await conn.fetch(
             """
-            SELECT user_id, team_name 
+            SELECT user_id, team_name, is_ranked 
             FROM active_match_heroes 
             WHERE guild_id = $1
             """,
@@ -925,6 +1023,7 @@ async def cmd_win_team(interaction: discord.Interaction, team: app_commands.Choi
             )
             return
 
+        is_ranked_match = players[0]["is_ranked"]
         winners_ids = [p["user_id"] for p in players if p["team_name"] == winner_team_val]
 
         if not winners_ids:
@@ -934,25 +1033,31 @@ async def cmd_win_team(interaction: discord.Interaction, team: app_commands.Choi
             )
             return
 
-        # Начисляем победителям по 50 ЭЛО
-        for uid in winners_ids:
-            # Сначала убедимся, что игрок есть в бд (upsert)
-            await conn.execute(
-                """
-                INSERT INTO players (user_id, elo) VALUES ($1, $2)
-                ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 50
-                """,
-                uid, DEFAULT_ELO + 50
+        if is_ranked_match:
+            # Начисляем победителям по 50 ЭЛО
+            for uid in winners_ids:
+                await conn.execute(
+                    """
+                    INSERT INTO players (user_id, elo) VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 50
+                    """,
+                    uid, DEFAULT_ELO + 50
+                )
+            
+            # Очищаем активный матч, так как игра завершилась
+            await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", guild_id)
+
+            mentions = " ".join(f"<@{uid}>" for uid in winners_ids)
+            await interaction.response.send_message(
+                f"🎉 **Команда {team.name} побеждает в рейтинговом матче!**\n"
+                f"Все участники команды получают **+50 ЭЛО**:\n{mentions}"
             )
-
-        # Очищаем активный матч, так как игра завершилась
-        await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", guild_id)
-
-        mentions = " ".join(f"<@{uid}>" for uid in winners_ids)
-        await interaction.response.send_message(
-            f"🎉 **Команда {team.name} побеждает!**\n"
-            f"Все участники команды получают **+50 ЭЛО**:\n{mentions}"
-        )
+        else:
+            # Очищаем активный матч
+            await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", guild_id)
+            await interaction.response.send_message(
+                f"🎉 **Команда {team.name} побеждает!**\n*(Этот матч был не рейтинговым, ЭЛО начислено не было)*"
+            )
 
 
 # ───────────── /mvp_win ──────────────
@@ -995,6 +1100,52 @@ async def cmd_mvp_loss(interaction: discord.Interaction, player: discord.Member)
     await interaction.response.send_message(
         f"🌟 **MVP проигравших!** Игрок {player.mention} получает **+75 ЭЛО**!"
     )
+
+
+# ───────────── /random ────────────────
+@bot.tree.command(
+    name="random",
+    description="Выбрать случайного героя (можно указать роль)"
+)
+@app_commands.describe(role="Роль: gold, exp, mid, jungle, roam")
+@app_commands.choices(role=[
+    app_commands.Choice(name="🪙 Gold (Стрелок)", value="gold"),
+    app_commands.Choice(name="🛡️ Exp (Боец)", value="exp"),
+    app_commands.Choice(name="🔮 Mid (Маг)", value="mid"),
+    app_commands.Choice(name="⚔️ Jungle (Лесник/Убийца)", value="jungle"),
+    app_commands.Choice(name="👣 Roam (Танк/Поддержка)", value="roam")
+])
+async def cmd_random(interaction: discord.Interaction, role: app_commands.Choice[str] = None):
+    heroes = load_heroes()
+    
+    if role:
+        role_val = role.value
+        role_heroes = [h for h in heroes if HERO_ROLES.get(h, "exp") == role_val]
+        if not role_heroes:
+            await interaction.response.send_message(
+                f"❌ Героев для роли {role.name} не найдено.",
+                ephemeral=True
+            )
+            return
+        chosen_hero = random.choice(role_heroes)
+        role_label = role.name
+        await interaction.response.send_message(
+            f"🎲 {interaction.user.mention} крутит рандомайзер на роль **{role_label}** и выбивает: **{chosen_hero}**!"
+        )
+    else:
+        chosen_hero = random.choice(heroes)
+        detected_role = HERO_ROLES.get(chosen_hero, "exp")
+        role_labels = {
+            "gold": "🪙 Gold",
+            "exp": "🛡️ Exp",
+            "mid": "🔮 Mid",
+            "jungle": "⚔️ Jungle",
+            "roam": "👣 Roam"
+        }
+        role_text = role_labels.get(detected_role, detected_role.capitalize())
+        await interaction.response.send_message(
+            f"🎲 {interaction.user.mention} крутит рандомайзер и выбивает случайного героя: **{chosen_hero}** ({role_text})!"
+        )
 
 
 # ───────────── /start_test ────────────
@@ -1064,7 +1215,7 @@ async def cmd_start_test(interaction: discord.Interaction):
 
     # ── Embed: лобби (как выглядит сбор, когда все готовы) ──
     lobby_embed = discord.Embed(
-        title="⚔️  MOBILE LEGENDS — КАСТОМНЫЙ МАТЧ 5×5",
+        title="⚔️  MOBILE LEGENDS — РЕЙТИНГОВЫЙ МАТЧ 5×5",
         description=(
             "🔊 Голосовой канал: **Тестовый канал**\n"
             "👥 Игроков: **10** · ✅ Готовы: **10** / 10\n"
@@ -1084,7 +1235,7 @@ async def cmd_start_test(interaction: discord.Interaction):
 
     # ── Embed: результат матча ──
     header_embed = discord.Embed(
-        title="🏆  МАТЧ СФОРМИРОВАН!",
+        title="🏆 РЕЙТИНГОВЫЙ МАТЧ СФОРМИРОВАН!",
         description=(
             f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1116,52 +1267,6 @@ async def cmd_start_test(interaction: discord.Interaction):
         content="⬇️ **ТЕСТ — Так выглядит результат матча:**",
         embeds=[header_embed, embed_a, embed_b],
     )
-
-
-# ───────────── /random ────────────────
-@bot.tree.command(
-    name="random",
-    description="Выбрать случайного героя (можно указать роль)"
-)
-@app_commands.describe(role="Роль: gold, exp, mid, jungle, roam")
-@app_commands.choices(role=[
-    app_commands.Choice(name="🪙 Gold (Стрелок)", value="gold"),
-    app_commands.Choice(name="🛡️ Exp (Боец)", value="exp"),
-    app_commands.Choice(name="🔮 Mid (Маг)", value="mid"),
-    app_commands.Choice(name="⚔️ Jungle (Лесник/Убийца)", value="jungle"),
-    app_commands.Choice(name="👣 Roam (Танк/Поддержка)", value="roam")
-])
-async def cmd_random(interaction: discord.Interaction, role: app_commands.Choice[str] = None):
-    heroes = load_heroes()
-    
-    if role:
-        role_val = role.value
-        role_heroes = [h for h in heroes if HERO_ROLES.get(h, "exp") == role_val]
-        if not role_heroes:
-            await interaction.response.send_message(
-                f"❌ Героев для роли {role.name} не найдено.",
-                ephemeral=True
-            )
-            return
-        chosen_hero = random.choice(role_heroes)
-        role_label = role.name
-        await interaction.response.send_message(
-            f"🎲 {interaction.user.mention} крутит рандомайзер на роль **{role_label}** и выбивает: **{chosen_hero}**!"
-        )
-    else:
-        chosen_hero = random.choice(heroes)
-        detected_role = HERO_ROLES.get(chosen_hero, "exp")
-        role_labels = {
-            "gold": "🪙 Gold",
-            "exp": "🛡️ Exp",
-            "mid": "🔮 Mid",
-            "jungle": "⚔️ Jungle",
-            "roam": "👣 Roam"
-        }
-        role_text = role_labels.get(detected_role, detected_role.capitalize())
-        await interaction.response.send_message(
-            f"🎲 {interaction.user.mention} крутит рандомайзер и выбивает случайного героя: **{chosen_hero}** ({role_text})!"
-        )
 
 
 # ═══════════════════════════ RUN ═════════════════════════════════
