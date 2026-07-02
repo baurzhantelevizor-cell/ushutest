@@ -475,10 +475,12 @@ class ReadyView(discord.ui.View):
 # ═══════════════════════ MODERATOR DECISION VIEW ═══════════════════════
 class MatchPreviewView(discord.ui.View):
     """Панель управления с кнопками для Ведущего матча."""
-    def __init__(self, lobby: LobbyState, players: list[discord.Member], rerolls_left: int = 1):
+    def __init__(self, lobby: LobbyState, players: list[discord.Member], team_a: list[tuple[discord.Member, int]], team_b: list[tuple[discord.Member, int]], rerolls_left: int = 1):
         super().__init__(timeout=600)  # Срок действия 10 минут
         self.lobby = lobby
         self.players = players
+        self.team_a = team_a
+        self.team_b = team_b
         self.rerolls_left = rerolls_left
 
         # Кнопка Рандом (перерандом состава) доступна, если остались попытки
@@ -513,7 +515,7 @@ class MatchPreviewView(discord.ui.View):
         await interaction.response.edit_message(view=self)
 
         # Переходим к финальной стадии: раздача героев, сохранение в БД и перенос по каналам
-        await finalize_and_launch_match(self.lobby, self.players)
+        await finalize_and_launch_match(self.lobby, self.players, self.team_a, self.team_b)
 
     async def on_reroll_click(self, interaction: discord.Interaction):
         if not is_moderator(interaction.user):
@@ -592,7 +594,7 @@ async def prepare_match_preview(
     )
     embed_b.add_field(name="Состав", value=build_preview_lines(team_b), inline=False)
 
-    view = MatchPreviewView(lobby, players, rerolls_left)
+    view = MatchPreviewView(lobby, players, team_a, team_b, rerolls_left)
 
     if interaction_to_use:
         # Если вызвано по кнопке перерандома, редактируем старое сообщение
@@ -609,23 +611,10 @@ async def prepare_match_preview(
 
 
 # ═══════════════════════════ FINAL LAUNCH ═════════════════════════
-async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Member]):
+async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Member], team_a: list[tuple[discord.Member, int]], team_b: list[tuple[discord.Member, int]]):
     """Финальная раздача героев, запись в БД и перемещение игроков."""
     heroes = load_heroes()
     
-    user_ids = [p.id for p in players]
-    elos = await get_elos_bulk(user_ids)
-    players_with_elo = [(p, elos[p.id]) for p in players]
-
-    # Снова делим на команды (чтобы зафиксировать текущий состав)
-    if lobby.match_type in ("ranked", "classic"):
-        team_a, team_b = balance_teams_snake(players_with_elo)
-    else:
-        # Chaos
-        shuffled = players_with_elo.copy()
-        random.shuffle(shuffled)
-        team_a, team_b = shuffled[:5], shuffled[5:]
-
     roles_order = ["gold", "exp", "mid", "jungle", "roam"]
     team_a_full = []
     team_b_full = []
@@ -689,9 +678,6 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
                 member.id, lobby.voice_channel.guild.id, hero, role, match_id, "Команда 2", is_ranked_bool
             )
 
-    embed_a = build_result_embed(team_a_full, "🔵 КОМАНДА 1", EMBED_COLOR_TEAM_A, total_a)
-    embed_b = build_result_embed(team_b_full, "🔴 КОМАНДА 2", EMBED_COLOR_TEAM_B, total_b)
-
     mentions = " ".join(m.mention for m in players)
 
     match_title = "🏆 РЕЙТИНГОВЫЙ МАТЧ СФОРМИРОВАН!" if lobby.match_type == "ranked" else (
@@ -731,7 +717,23 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
         elif chan_team1 or chan_team2:
             move_notes = "\n⚠️ Не удалось переместить игроков (возможно, у бота нет прав «Перемещать участников»)."
 
-    header_embed = discord.Embed(
+    # ─── СОЗДАНИЕ ЕДИНОГО EMBED'А РЕЗУЛЬТАТА ───
+    role_emojis = {
+        "gold": "🪙 Gold",
+        "exp": "🛡️ Exp",
+        "mid": "🔮 Mid",
+        "jungle": "⚔️ Jungle",
+        "roam": "👣 Roam"
+    }
+
+    def build_embed_team_section(team_full_list: list) -> str:
+        sec_lines = []
+        for idx, (m, elo, hero, role) in enumerate(team_full_list, start=1):
+            role_label = role_emojis.get(role, role.capitalize())
+            sec_lines.append(f"`{idx}.` {m.mention} — 🎖️ {elo} ЭЛО\n    {role_label} · 🦸 : **{hero}**")
+        return "\n".join(sec_lines)
+
+    result_embed = discord.Embed(
         title=match_title,
         description=(
             f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
@@ -744,10 +746,20 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
         ),
         color=0xFEE75C,
     )
+    result_embed.add_field(
+        name=f"🔵 КОМАНДА 1 (Суммарный ЭЛО: {total_a})",
+        value=build_embed_team_section(team_a_full),
+        inline=False
+    )
+    result_embed.add_field(
+        name=f"🔴 КОМАНДА 2 (Суммарный ЭЛО: {total_b})",
+        value=build_embed_team_section(team_b_full),
+        inline=False
+    )
 
     await lobby.text_channel.send(
         content=mentions,
-        embeds=[header_embed, embed_a, embed_b],
+        embed=result_embed,
     )
 
     active_lobbies.pop(lobby.voice_channel.id, None)
@@ -917,11 +929,16 @@ async def on_voice_state_update(
         async with db_pool.acquire() as conn:
             # Получаем игроков активного матча
             active_players = await conn.fetch(
-                "SELECT user_id FROM active_match_heroes WHERE guild_id = $1",
+                "SELECT user_id, is_ranked FROM active_match_heroes WHERE guild_id = $1",
                 guild_id
             )
 
             if active_players and len(active_players) >= 10:
+                # В режиме хаос (is_ranked = False) опрос автоматически не шлём
+                is_ranked_match = active_players[0]["is_ranked"]
+                if not is_ranked_match:
+                    return
+
                 active_ids = {p["user_id"] for p in active_players}
                 
                 # Считаем, сколько участников активного матча сейчас находятся в голосовом канале сбора
