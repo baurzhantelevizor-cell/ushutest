@@ -719,6 +719,160 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
         elif chan_team1 or chan_team2:
             move_notes = "\n⚠️ Не удалось переместить игроков (возможно, у бота нет прав «Перемещать участников»)."
 
+# ═══════════════════════ PLAYER REROLL BUTTON VIEW ═══════════════════════
+class PlayerRerollButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Реролл 🎲",
+            style=discord.ButtonStyle.secondary,
+            custom_id="player_hero_reroll_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user = interaction.user
+        guild_id = interaction.guild_id
+
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT hero_name, role, match_id, is_ranked, rerolls 
+                FROM active_match_heroes 
+                WHERE user_id = $1 AND guild_id = $2
+                """,
+                user.id, guild_id
+            )
+
+            if not row:
+                await interaction.response.send_message(
+                    "❌ Вы не участвуете в текущем сформированном матче.",
+                    ephemeral=True
+                )
+                return
+
+            current_hero = row["hero_name"]
+            role = row["role"]
+            match_id = row["match_id"]
+            current_rerolls = row["rerolls"]
+
+            if current_rerolls >= 2:
+                await interaction.response.send_message(
+                    "❌ Вы уже исчерпали лимит замен героев (максимум 2 замены на матч).",
+                    ephemeral=True
+                )
+                return
+
+            busy_rows = await conn.fetch(
+                "SELECT hero_name FROM active_match_heroes WHERE match_id = $1",
+                match_id
+            )
+            busy_heroes = {r["hero_name"] for r in busy_rows}
+
+            heroes = load_heroes()
+            role_heroes = [
+                h for h in heroes 
+                if HERO_ROLES.get(h, "exp") == role and h not in busy_heroes and h != current_hero
+            ]
+
+            if not role_heroes:
+                role_heroes = [h for h in heroes if h not in busy_heroes and h != current_hero]
+
+            if not role_heroes:
+                await interaction.response.send_message(
+                    "❌ К сожалению, нет доступных героев для замены.",
+                    ephemeral=True
+                )
+                return
+
+            new_hero = random.choice(role_heroes)
+            new_reroll_count = current_rerolls + 1
+
+            await conn.execute(
+                """
+                UPDATE active_match_heroes 
+                SET hero_name = $1, rerolls = $2
+                WHERE user_id = $3 AND guild_id = $4
+                """,
+                new_hero, new_reroll_count, user.id, guild_id
+            )
+
+            # Получаем обновленный состав команд для обновления исходного сообщения
+            all_match_players = await conn.fetch(
+                """
+                SELECT user_id, hero_name, role, team_name 
+                FROM active_match_heroes 
+                WHERE match_id = $1
+                """,
+                match_id
+            )
+
+        role_emojis = {
+            "gold": "🪙 Gold",
+            "exp": "🛡️ Exp",
+            "mid": "🔮 Mid",
+            "jungle": "⚔️ Jungle",
+            "roam": "👣 Roam"
+        }
+        role_label = role_emojis.get(role, role.capitalize())
+
+        await interaction.response.send_message(
+            f"🔄 {user.mention}, ваш герой был заменен!\n"
+            f"Роль: **{role_label}** · Попытка: **{new_reroll_count}/2**\n"
+            f"Старый герой: ~~{current_hero}~~\n"
+            f"Новый герой: **{new_hero}**",
+            ephemeral=True
+        )
+
+        # Перестраиваем Embed в исходном сообщении, чтобы показать измененного героя
+        # Нам нужно достать старый Embed и обновить поля
+        message = interaction.message
+        if message and message.embeds:
+            old_embed = message.embeds[0]
+            
+            # Разделяем игроков по командам
+            team1_lines = []
+            team2_lines = []
+            idx1, idx2 = 1, 1
+
+            for p in all_match_players:
+                p_id = p["user_id"]
+                p_hero = p["hero_name"]
+                p_role = p["role"]
+                p_team = p["team_name"]
+                r_label = role_emojis.get(p_role, p_role.capitalize())
+
+                line_str = f"`{idx1 if p_team == 'Команда 1' else idx2}.` <@{p_id}> — *герой обновлен*\n    {r_label} · 🦸 : **{p_hero}**"
+                if p_team == "Команда 1":
+                    team1_lines.append(f"`{idx1}.` <@{p_id}>\n    {r_label} · 🦸 : **{p_hero}**")
+                    idx1 += 1
+                else:
+                    team2_lines.append(f"`{idx2}.` <@{p_id}>\n    {r_label} · 🦸 : **{p_hero}**")
+                    idx2 += 1
+
+            new_embed = discord.Embed(
+                title=old_embed.title,
+                description=old_embed.description,
+                color=old_embed.color
+            )
+            
+            # Ищем названия полей с суммарным ELO
+            t1_name = old_embed.fields[0].name if len(old_embed.fields) > 0 else "🔵 КОМАНДА 1"
+            t2_name = old_embed.fields[1].name if len(old_embed.fields) > 1 else "🔴 КОМАНДА 2"
+
+            new_embed.add_field(name=t1_name, value="\n".join(team1_lines) if team1_lines else "_Пусто_", inline=False)
+            new_embed.add_field(name=t2_name, value="\n".join(team2_lines) if team2_lines else "_Пусто_", inline=False)
+
+            try:
+                await message.edit(embed=new_embed)
+            except discord.HTTPException:
+                pass
+
+
+class PlayerRerollView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # Кнопка работает без таймаута
+        self.add_item(PlayerRerollButton())
+
+
     # ─── СОЗДАНИЕ ЕДИНОГО EMBED'А РЕЗУЛЬТАТА ───
     role_emojis = {
         "gold": "🪙 Gold",
@@ -732,7 +886,7 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
         sec_lines = []
         for idx, (m, elo, hero, role) in enumerate(team_full_list, start=1):
             role_label = role_emojis.get(role, role.capitalize())
-            sec_lines.append(f"`{idx}.` {m.mention} — 🎖️ {elo} ЭЛО\n    {role_label} · 🦸 : **{hero}**")
+            sec_lines.append(f"`{idx}.` {m.mention}\n    {role_label} · 🦸 : **{hero}**")
         return "\n".join(sec_lines)
 
     result_embed = discord.Embed(
@@ -741,10 +895,10 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
             f"Разница ЭЛО команд: **{abs(total_a - total_b)}**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "Герои распределены по ролям. Удачи на поле боя! 🎮\n"
-            "Если у вас нет выпавшего героя, напишите слэш-команду `/reroll`"
+            "Если у вас нет выпавшего героя, нажмите кнопку **Реролл 🎲** ниже"
             f"{move_notes}\n\n"
             "**После игры администратор может выбрать победителя с помощью `/win_team`**" if lobby.match_type == "ranked"
-            else f"Герои распределены. Удачи на поле боя! 🎮\nЕсли у вас нет выпавшего героя, напишите слэш-команду `/reroll`{move_notes}\n\n*(Этот матч не влияет на ЭЛО)*"
+            else f"Герои распределены. Удачи на поле боя! 🎮\nЕсли у вас нет выпавшего героя, нажмите кнопку **Реролл 🎲** ниже{move_notes}\n\n*(Этот матч не влияет на ЭЛО)*"
         ),
         color=0xFEE75C,
     )
@@ -759,9 +913,11 @@ async def finalize_and_launch_match(lobby: LobbyState, players: list[discord.Mem
         inline=False
     )
 
+    view = PlayerRerollView()
     await lobby.text_channel.send(
         content=mentions,
         embed=result_embed,
+        view=view
     )
 
     active_lobbies.pop(lobby.voice_channel.id, None)
@@ -777,6 +933,7 @@ async def on_ready():
     print(f"[DB] Загружены настройки для {len(guild_settings_cache)} гильдий.")
 
     bot.add_view(ReadyView())
+    bot.add_view(PlayerRerollView())
 
     try:
         guild_ids_str = os.environ.get("GUILD_ID", "")
