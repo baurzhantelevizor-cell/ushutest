@@ -1719,6 +1719,52 @@ async def cmd_unlink(interaction: discord.Interaction):
         )
 
 
+# ───────────── /link_admin ────────────
+@bot.tree.command(name="link_admin", description="[Админ] Привязать игровой ник MLBB за другого игрока")
+@app_commands.describe(
+    player="Игрок Discord, которому нужно привязать ник",
+    nickname="Ник игрока в Mobile Legends",
+    game_id="ID игрока в MLBB (необязательно)"
+)
+@app_commands.default_permissions(administrator=True)
+async def cmd_link_admin(interaction: discord.Interaction, player: discord.Member, nickname: str, game_id: str | None = None):
+    if len(nickname) > 100:
+        await interaction.response.send_message(
+            "❌ Ник слишком длинный (макс. 100 символов).", ephemeral=True
+        )
+        return
+
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT game_nickname FROM linked_accounts WHERE user_id = $1",
+            player.id
+        )
+        
+        await conn.execute(
+            """
+            INSERT INTO linked_accounts (user_id, game_nickname, game_id) 
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE 
+            SET game_nickname = $2, game_id = $3, linked_at = CURRENT_TIMESTAMP
+            """,
+            player.id, nickname, game_id
+        )
+
+    id_text = f"\n🆔 ID в игре: **{game_id}**" if game_id else ""
+
+    if existing:
+        await interaction.response.send_message(
+            f"✅ Ник игрока {player.mention} обновлён!\n"
+            f"Старый ник: ~~{existing['game_nickname']}~~\n"
+            f"Новый ник: **{nickname}**{id_text}"
+        )
+    else:
+        await interaction.response.send_message(
+            f"✅ Аккаунт {player.mention} успешно привязан!\n"
+            f"🎮 Ник в MLBB: **{nickname}**{id_text}"
+        )
+
+
 # ───────────── /cancel ────────────────
 @bot.tree.command(name="cancel", description="Отменить текущий сбор на матч")
 @app_commands.default_permissions(administrator=True)
