@@ -1899,8 +1899,29 @@ async def analyze_screenshot(image_bytes: bytes) -> dict:
             match_result = "defeat"
             break
 
-    # Дополнительная проверка счета сверху как запасной вариант
-    # Победителей также можно определить по счету, но пока оставим базовый OCR надписи.
+    # Дополнительная проверка счета сверху как запасной вариант, если текст не найден
+    if not match_result:
+        # Ищем два числа в самом верху экрана (y < 15% высоты)
+        score_candidates = []
+        for t in all_texts:
+            if t["center_y"] < img_height * 0.15:
+                # Пытаемся распарсить как число
+                try:
+                    val = int(t["text"].replace("o", "0").replace("O", "0").strip())
+                    score_candidates.append((val, t["center_x"]))
+                except ValueError:
+                    continue
+        
+        # Если нашли два числа, делим на левое и правое
+        if len(score_candidates) >= 2:
+            # Сортируем по X
+            score_candidates.sort(key=lambda item: item[1])
+            left_score = score_candidates[0][0]
+            right_score = score_candidates[-1][0]
+            # Левый счет > правого счета -> Синие (левые) выиграли -> victory
+            if left_score != right_score:
+                match_result = "victory" if left_score > right_score else "defeat"
+                print(f"[OCR Fallback] Результат по счету: Left {left_score} vs Right {right_score} -> {match_result}")
     
     # Определяем MVP
     mvp_detected = []
@@ -2015,7 +2036,7 @@ class ScanConfirmView(discord.ui.View):
         self.matched_players = matched_players
         self.guild_id = guild_id
     
-    @discord.ui.button(label="✅ Подтвердить и начислить", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="✅ Подтвердить (Тестовый режим)", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Только админ может подтвердить.", ephemeral=True)
@@ -2029,75 +2050,24 @@ class ScanConfirmView(discord.ui.View):
         losers = [p for p in self.matched_players if p["is_winner"] is False]
         mvps = [p for p in self.matched_players if p.get("is_mvp")]
         
-        async with db_pool.acquire() as conn:
-            # Начисляем ЭЛО победителям
-            for p in winners:
-                uid = p["user_id"]
-                await conn.execute(
-                    """
-                    INSERT INTO players (user_id, elo) VALUES ($1, $2)
-                    ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 50
-                    """,
-                    uid, DEFAULT_ELO + 50
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO player_stats (user_id, matches, wins, losses, mvps) VALUES ($1, 1, 1, 0, 0)
-                    ON CONFLICT (user_id) DO UPDATE SET matches = player_stats.matches + 1, wins = player_stats.wins + 1
-                    """,
-                    uid
-                )
-            
-            # Снимаем ЭЛО у проигравших
-            for p in losers:
-                uid = p["user_id"]
-                await conn.execute(
-                    """
-                    INSERT INTO players (user_id, elo) VALUES ($1, $2)
-                    ON CONFLICT (user_id) DO UPDATE SET elo = GREATEST(players.elo - 50, 0)
-                    """,
-                    uid, DEFAULT_ELO - 50
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO player_stats (user_id, matches, wins, losses, mvps) VALUES ($1, 1, 0, 1, 0)
-                    ON CONFLICT (user_id) DO UPDATE SET matches = player_stats.matches + 1, losses = player_stats.losses + 1
-                    """,
-                    uid
-                )
-            
-            # Начисляем MVP бонус
-            for p in mvps:
-                uid = p["user_id"]
-                await conn.execute(
-                    """
-                    INSERT INTO players (user_id, elo) VALUES ($1, $2)
-                    ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 25
-                    """,
-                    uid, DEFAULT_ELO + 25
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO player_stats (user_id, mvps) VALUES ($1, 1)
-                    ON CONFLICT (user_id) DO UPDATE SET mvps = player_stats.mvps + 1
-                    """,
-                    uid
-                )
+        # Временное отключение записей в БД для тестового режима
+        # Никакие изменения ЭЛО или статистики не применяются.
         
         # Формируем итоговое сообщение
         result_lines = []
         if winners:
             w_mentions = " ".join(f"<@{p['user_id']}>" for p in winners)
-            result_lines.append(f"🟢 **Победители (+50 ЭЛО):**\n{w_mentions}")
+            result_lines.append(f"🟢 **Победители (тест, +50 ЭЛО не начислено):**\n{w_mentions}")
         if losers:
             l_mentions = " ".join(f"<@{p['user_id']}>" for p in losers)
-            result_lines.append(f"🔴 **Проигравшие (-50 ЭЛО):**\n{l_mentions}")
+            result_lines.append(f"🔴 **Проигравшие (тест, -50 ЭЛО не списано):**\n{l_mentions}")
         if mvps:
             m_mentions = " ".join(f"<@{p['user_id']}>" for p in mvps)
-            result_lines.append(f"🌟 **MVP (+25 ЭЛО):**\n{m_mentions}")
+            result_lines.append(f"🌟 **MVP (тест, +25 ЭЛО не начислено):**\n{m_mentions}")
         
         await interaction.followup.send(
-            f"✅ **Результаты матча применены по скриншоту!**\n\n" + "\n\n".join(result_lines)
+            f"🧪 **[Тестовый режим] Результаты матча успешно проверены по скриншоту!**\n"
+            f"*(Никакие изменения ЭЛО или статистики не записывались в базу данных)*\n\n" + "\n\n".join(result_lines)
         )
     
     @discord.ui.button(label="❌ Отмена", style=discord.ButtonStyle.danger)
@@ -2161,7 +2131,7 @@ async def cmd_scan(interaction: discord.Interaction, screenshot: discord.Attachm
         
         embed = discord.Embed(
             title="🔍 АНАЛИЗ СКРИНШОТА MLBB",
-            description=f"**Результат матча:** {match_status}",
+            description=f"**Результат матча:** {match_status}\n*(Тестовый режим: подтверждение не меняет ЭЛО)*",
             color=0x00FF00 if results["match_result"] == "victory" else (
                 0xFF0000 if results["match_result"] == "defeat" else 0xFFFF00
             )
@@ -2222,7 +2192,7 @@ async def cmd_scan(interaction: discord.Interaction, screenshot: discord.Attachm
                 inline=False
             )
         
-        embed.set_footer(text=f"Распознано {len(ocr_data['all_texts'])} текстовых элементов · EasyOCR")
+        embed.set_footer(text=f"Распознано {len(ocr_data['all_texts'])} текстовых элементов · Tesseract OCR")
         
         # Если есть совпадения — показываем кнопки подтверждения
         if results["matched"] and results["match_result"]:
