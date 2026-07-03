@@ -2130,25 +2130,7 @@ async def cmd_scan(interaction: discord.Interaction, screenshot: discord.Attachm
                       "Убедитесь, что игроки привязали ники через `/link`.",
                 inline=False
             )
-        
-        # Ненайденные привязанные аккаунты
-        if results["unmatched"]:
-            unmatched_lines = []
-            for u in results["unmatched"][:5]:
-                member = interaction.guild.get_member(u["user_id"])
-                name = member.mention if member else f"<@{u['user_id']}>"
-                unmatched_lines.append(f"❓ {name} — `{u['game_nickname']}`")
-            embed.add_field(
-                name="📋 Не найдены на скриншоте",
-                value="\n".join(unmatched_lines),
-                inline=False
-            )
-        
-        embed.set_footer(text=f"Распознано {len(ocr_data['all_texts'])} текстовых элементов · Tesseract OCR")
-        
-        # Создаем текстовый файл со всеми распознанными словами для отладки
-        debug_content = "\n".join(f"[{t['side'].upper()}] (x={t['center_x']:.0f}, y={t['center_y']:.0f}) confidence={t['confidence']:.2f}: {t['text']}" for t in ocr_data["all_texts"])
-        debug_file = discord.File(io.StringIO(debug_content), filename="ocr_raw_debug.txt")
+        embed.set_footer(text=f"Распознано {len(ocr_data['all_texts'])} текстовых элементов · EasyOCR")
         
         # Если есть совпадения — показываем кнопки подтверждения
         if results["matched"] and results["match_result"]:
@@ -2156,14 +2138,12 @@ async def cmd_scan(interaction: discord.Interaction, screenshot: discord.Attachm
             await interaction.followup.send(
                 "📋 **Проверьте результаты анализа и подтвердите начисление ЭЛО:**",
                 embed=embed,
-                file=debug_file,
                 view=view
             )
         else:
             await interaction.followup.send(
                 "⚠️ **Результаты анализа (автоматическое начисление невозможно):**",
-                embed=embed,
-                file=debug_file
+                embed=embed
             )
     
     except Exception as e:
