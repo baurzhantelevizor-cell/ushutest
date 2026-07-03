@@ -1802,7 +1802,7 @@ def fuzzy_match(ocr_text: str, nickname: str) -> float:
 
 
 async def analyze_screenshot(image_bytes: bytes) -> dict:
-    """Анализирует скриншот MLBB и извлекает данные с помощью pytesseract."""
+    """Анализирует скриншот MLBB и извлекает данные с помощью EasyOCR."""
     loop = asyncio.get_event_loop()
     
     # Открываем изображение
@@ -1814,39 +1814,25 @@ async def analyze_screenshot(image_bytes: bytes) -> dict:
     resized_img = original_img.resize((img_width * 2, img_height * 2), Image.Resampling.LANCZOS)
     # 2. Конвертируем в градации серого (убирает влияние цветных клан-тегов)
     processed_img = resized_img.convert("L")
+    img_array = np.array(processed_img)
     
-    # Запускаем Tesseract OCR в отдельном потоке
-    # Используем комбинированный язык rus+eng и указываем локальную папку tessdata
-    def run_tesseract():
-        custom_config = f'--tessdata-dir "{TESSDATA_DIR}" --psm 11'
-        return pytesseract.image_to_data(processed_img, lang='rus+eng', output_type=pytesseract.Output.DICT, config=custom_config)
-
-    data = await loop.run_in_executor(None, run_tesseract)
+    # Запускаем EasyOCR в отдельном потоке
+    reader = get_ocr_reader()
+    results = await loop.run_in_executor(None, lambda: reader.readtext(img_array))
     
     all_texts = []
-    n_boxes = len(data['text'])
-    for i in range(n_boxes):
-        text = data['text'][i].strip()
-        conf = float(data['conf'][i])
-        # Фильтруем пустые и низкоуверенные распознавания
-        if not text or conf < 30:
-            continue
-            
-        x = data['left'][i]
-        y = data['top'][i]
-        w = data['width'][i]
-        h = data['height'][i]
-        
-        # Делим координаты на 2, чтобы вернуть их к исходному размеру скриншота
-        center_x = (x + w / 2) / 2.0
-        center_y = (y + h / 2) / 2.0
+    for (bbox, text, conf) in results:
+        # bbox = [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+        # Координаты на увеличенном изображении, делим на 2 для возврата к оригиналу
+        center_x = (sum(p[0] for p in bbox) / 4) / 2.0
+        center_y = (sum(p[1] for p in bbox) / 4) / 2.0
         
         all_texts.append({
             "text": text,
-            "confidence": conf / 100.0,
+            "confidence": conf,
             "center_x": center_x,
             "center_y": center_y,
-            "side": "left" if center_x < img_width else "right"
+            "side": "left" if center_x < img_width / 2.0 else "right"
         })
     
     # Определяем результат матча (VICTORY / DEFEAT / ПОБЕДА)
@@ -1860,7 +1846,7 @@ async def analyze_screenshot(image_bytes: bytes) -> dict:
         elif "DEFEAT" in text_upper or "ПОРАЖЕН" in text_upper or "DEF" in text_upper:
             match_result = "defeat"
             break
-
+ 
     # Дополнительная проверка счета сверху как запасной вариант, если текст не найден
     if not match_result:
         # Ищем два числа в самом верху экрана (y < 15% высоты)
