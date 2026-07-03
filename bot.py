@@ -1873,10 +1873,14 @@ async def analyze_screenshot(image_bytes: bytes) -> dict:
     
     # Определяем MVP
     mvp_detected = []
+    # Допускаем частые ошибки OCR: AVP, MYP, NVP, MWP
+    mvp_keywords = {"MVP", "МВП", "AVP", "MYP", "NVP", "MWP", "MVR"}
     for t in all_texts:
-        text_upper = t["text"].upper()
-        if "MVP" in text_upper or "МВП" in text_upper:
+        text_clean = t["text"].upper().replace(".", "").replace(",", "").strip()
+        # Проверяем точное совпадение или если ключевое слово содержится внутри распознанной строки
+        if any(kw in text_clean for kw in mvp_keywords):
             mvp_detected.append(t)
+            print(f"[OCR MVP] Обнаружен значок MVP: {t['text']} на стороне {t['side']} (y={t['center_y']:.0f})")
             
     return {
         "all_texts": all_texts,
