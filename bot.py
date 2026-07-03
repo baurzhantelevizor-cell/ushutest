@@ -2205,18 +2205,24 @@ async def cmd_scan(interaction: discord.Interaction, screenshot: discord.Attachm
         
         embed.set_footer(text=f"Распознано {len(ocr_data['all_texts'])} текстовых элементов · Tesseract OCR")
         
+        # Создаем текстовый файл со всеми распознанными словами для отладки
+        debug_content = "\n".join(f"[{t['side'].upper()}] (x={t['center_x']:.0f}, y={t['center_y']:.0f}) confidence={t['confidence']:.2f}: {t['text']}" for t in ocr_data["all_texts"])
+        debug_file = discord.File(io.StringIO(debug_content), filename="ocr_raw_debug.txt")
+        
         # Если есть совпадения — показываем кнопки подтверждения
         if results["matched"] and results["match_result"]:
             view = ScanConfirmView(results["matched"], interaction.guild_id)
             await interaction.followup.send(
                 "📋 **Проверьте результаты анализа и подтвердите начисление ЭЛО:**",
                 embed=embed,
+                file=debug_file,
                 view=view
             )
         else:
             await interaction.followup.send(
                 "⚠️ **Результаты анализа (автоматическое начисление невозможно):**",
-                embed=embed
+                embed=embed,
+                file=debug_file
             )
     
     except Exception as e:
