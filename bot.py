@@ -1871,16 +1871,75 @@ async def analyze_screenshot(image_bytes: bytes) -> dict:
                 match_result = "victory" if left_score > right_score else "defeat"
                 print(f"[OCR Fallback] Результат по счету: Left {left_score} vs Right {right_score} -> {match_result}")
     
-    # Определяем MVP
+    # Определяем MVP через template matching (поиск значка по изображению)
     mvp_detected = []
-    # Допускаем частые ошибки OCR: AVP, MYP, NVP, MWP
-    mvp_keywords = {"MVP", "МВП", "AVP", "MYP", "NVP", "MWP", "MVR"}
-    for t in all_texts:
-        text_clean = t["text"].upper().replace(".", "").replace(",", "").strip()
-        # Проверяем точное совпадение или если ключевое слово содержится внутри распознанной строки
-        if any(kw in text_clean for kw in mvp_keywords):
-            mvp_detected.append(t)
-            print(f"[OCR MVP] Обнаружен значок MVP: {t['text']} на стороне {t['side']} (y={t['center_y']:.0f})")
+    try:
+        import cv2
+        from pathlib import Path as _Path
+
+        # Пути к шаблонам значков MVP
+        _base = _Path(__file__).parent
+        _templates = [
+            (_base / "mvp_winner.png", "winner"),
+            (_base / "mvp_loser.png",  "loser"),
+        ]
+
+        # Работаем с оригинальным (НЕ увеличенным) изображением для template matching
+        orig_array = np.array(original_img.convert("RGB"))
+        orig_gray  = cv2.cvtColor(orig_array, cv2.COLOR_RGB2GRAY)
+
+        for tmpl_path, tmpl_kind in _templates:
+            if not tmpl_path.exists():
+                continue
+            tmpl      = cv2.imread(str(tmpl_path), cv2.IMREAD_GRAYSCALE)
+            if tmpl is None:
+                continue
+            th, tw    = tmpl.shape[:2]
+
+            # Попробуем несколько масштабов (80%-130%), т.к. размер значка может меняться
+            for scale in [0.7, 0.8, 0.9, 1.0, 1.1, 1.2]:
+                new_w = max(1, int(tw * scale))
+                new_h = max(1, int(th * scale))
+                resized_tmpl = cv2.resize(tmpl, (new_w, new_h))
+
+                if orig_gray.shape[0] < new_h or orig_gray.shape[1] < new_w:
+                    continue
+
+                result = cv2.matchTemplate(orig_gray, resized_tmpl, cv2.TM_CCOEFF_NORMED)
+                threshold = 0.55
+                locs = np.where(result >= threshold)
+
+                for pt in zip(*locs[::-1]):  # (x, y)
+                    cx = pt[0] + new_w / 2
+                    cy = pt[1] + new_h / 2
+                    side = "left" if cx < img_width / 2.0 else "right"
+                    # Проверяем, не добавили ли уже MVP вблизи этой точки
+                    already = any(
+                        abs(m["center_x"] - cx) < 30 and abs(m["center_y"] - cy) < 30
+                        for m in mvp_detected
+                    )
+                    if not already:
+                        mvp_detected.append({
+                            "text": f"MVP({tmpl_kind})",
+                            "confidence": float(result[pt[1], pt[0]]),
+                            "center_x": cx,
+                            "center_y": cy,
+                            "side": side,
+                            "kind": tmpl_kind
+                        })
+                        print(f"[Template MVP] Найден {tmpl_kind} MVP: x={cx:.0f}, y={cy:.0f}, side={side}, conf={result[pt[1], pt[0]]:.2f}, scale={scale}")
+
+    except Exception as _e:
+        print(f"[Template MVP] Ошибка template matching: {_e}")
+
+    # Резервный OCR-поиск MVP если template matching не нашёл
+    if not mvp_detected:
+        mvp_keywords = {"MVP", "МВП", "AVP", "MYP", "NVP", "MWP", "MVR"}
+        for t in all_texts:
+            text_clean = t["text"].upper().replace(".", "").replace(",", "").strip()
+            if any(kw in text_clean for kw in mvp_keywords):
+                mvp_detected.append(t)
+                print(f"[OCR MVP fallback] {t['text']} на стороне {t['side']} (y={t['center_y']:.0f})")
             
     # Дополнительно собираем оценки игроков (числа вида X.X от 0 до 20)
     # Используем их как резервный способ обнаружить MVP (у MVP всегда наивысшая оценка)
