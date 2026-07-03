@@ -50,16 +50,11 @@ db_pool: asyncpg.Pool | None = None
 # Кэш настроек гильдии: guild_id → {voice_channel_id, ready_channel_id, voice_team1_id, voice_team2_id, host_role_id}
 guild_settings_cache: dict[int, dict[str, int | None]] = {}
 
-# OCR-ридер (ленивая инициализация при первом вызове /scan)
-ocr_reader = None
-
+# OCR-ридер (проверка наличия pytesseract)
+import pytesseract
+# Tesseract не требует ленивого тяжелого импорта, но мы обернем для совместимости
 def get_ocr_reader():
-    """Ленивая инициализация EasyOCR ридера."""
-    global ocr_reader
-    if ocr_reader is None:
-        import easyocr
-        ocr_reader = easyocr.Reader(["ru", "en"], gpu=False)
-    return ocr_reader
+    return pytesseract
 
 
 # ═══════════════════════════ DATABASE ════════════════════════════
@@ -1802,49 +1797,68 @@ def fuzzy_match(ocr_text: str, nickname: str) -> float:
 
 
 async def analyze_screenshot(image_bytes: bytes) -> dict:
-    """Анализирует скриншот MLBB и извлекает данные."""
+    """Анализирует скриншот MLBB и извлекает данные с помощью pytesseract."""
     loop = asyncio.get_event_loop()
     
     # Открываем изображение
     img = Image.open(io.BytesIO(image_bytes))
     img_width, img_height = img.size
-    img_array = np.array(img)
     
-    # Запускаем OCR в отдельном потоке (чтобы не блокировать бота)
-    reader = get_ocr_reader()
-    results = await loop.run_in_executor(None, lambda: reader.readtext(img_array))
+    # Запускаем Tesseract OCR в отдельном потоке
+    # Используем комбинированный язык rus+eng
+    def run_tesseract():
+        custom_config = r'--psm 11'
+        return pytesseract.image_to_data(img, lang='rus+eng', output_type=pytesseract.Output.DICT, config=custom_config)
+
+    data = await loop.run_in_executor(None, run_tesseract)
     
-    # Собираем все распознанные тексты с координатами
     all_texts = []
-    for (bbox, text, conf) in results:
-        # bbox = [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
-        center_x = sum(p[0] for p in bbox) / 4
-        center_y = sum(p[1] for p in bbox) / 4
+    n_boxes = len(data['text'])
+    for i in range(n_boxes):
+        text = data['text'][i].strip()
+        conf = float(data['conf'][i])
+        # Фильтруем пустые и низкоуверенные распознавания
+        if not text or conf < 30:
+            continue
+            
+        x = data['left'][i]
+        y = data['top'][i]
+        w = data['width'][i]
+        h = data['height'][i]
+        
+        center_x = x + w / 2
+        center_y = y + h / 2
+        
         all_texts.append({
             "text": text,
-            "confidence": conf,
+            "confidence": conf / 100.0,
             "center_x": center_x,
             "center_y": center_y,
             "side": "left" if center_x < img_width / 2 else "right"
         })
     
-    # Определяем результат матча (VICTORY / DEFEAT)
+    # Определяем результат матча (VICTORY / DEFEAT / ПОБЕДА)
     match_result = None
+    # Сначала проверяем классические ключевые слова
     for t in all_texts:
         text_upper = t["text"].upper()
-        if "VICTORY" in text_upper or "ПОБЕДА" in text_upper:
+        if "VICTORY" in text_upper or "ПОБЕДА" in text_upper or "VIC" in text_upper:
             match_result = "victory"
             break
-        elif "DEFEAT" in text_upper or "ПОРАЖЕН" in text_upper:
+        elif "DEFEAT" in text_upper or "ПОРАЖЕН" in text_upper or "DEF" in text_upper:
             match_result = "defeat"
             break
+
+    # Дополнительная проверка счета сверху как запасной вариант
+    # Победителей также можно определить по счету, но пока оставим базовый OCR надписи.
     
     # Определяем MVP
     mvp_detected = []
     for t in all_texts:
-        if "MVP" in t["text"].upper():
+        text_upper = t["text"].upper()
+        if "MVP" in text_upper or "МВП" in text_upper:
             mvp_detected.append(t)
-    
+            
     return {
         "all_texts": all_texts,
         "match_result": match_result,
