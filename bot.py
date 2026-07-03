@@ -91,28 +91,6 @@ def find_tesseract_cmd():
     if path:
         return path
     
-    # Проверяем стандартные пути Nix профилей
-    nix_profile_paths = [
-        "/nix/var/nix/profiles/default/bin/tesseract",
-        "/root/.nix-profile/bin/tesseract",
-        "/home/railway/.nix-profile/bin/tesseract"
-    ]
-    for p in nix_profile_paths:
-        if os.path.exists(p):
-            return p
-            
-    # Сканируем /nix/store на наличие tesseract
-    if os.path.exists("/nix/store"):
-        try:
-            for item in os.listdir("/nix/store"):
-                # Ищем папку, содержащую "tesseract"
-                if "tesseract-" in item and not item.endswith(".drv"):
-                    bin_path = os.path.join("/nix/store", item, "bin", "tesseract")
-                    if os.path.exists(bin_path):
-                        return bin_path
-        except Exception as e:
-            print(f"[OCR] Ошибка при сканировании /nix/store: {e}")
-
     # Стандартный путь в Debian/Ubuntu при установке через apt
     if os.path.exists("/usr/bin/tesseract"):
         return "/usr/bin/tesseract"
