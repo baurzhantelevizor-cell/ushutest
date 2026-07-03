@@ -1882,10 +1882,28 @@ async def analyze_screenshot(image_bytes: bytes) -> dict:
             mvp_detected.append(t)
             print(f"[OCR MVP] Обнаружен значок MVP: {t['text']} на стороне {t['side']} (y={t['center_y']:.0f})")
             
+    # Дополнительно собираем оценки игроков (числа вида X.X от 0 до 20)
+    # Используем их как резервный способ обнаружить MVP (у MVP всегда наивысшая оценка)
+    player_scores = []
+    for t in all_texts:
+        text = t["text"].strip()
+        try:
+            val = float(text)
+            if 0.0 < val <= 20.0 and "." in text:
+                player_scores.append({
+                    "score_val": val,
+                    "center_x": t["center_x"],
+                    "center_y": t["center_y"],
+                    "side": t["side"]
+                })
+        except ValueError:
+            pass
+
     return {
         "all_texts": all_texts,
         "match_result": match_result,
         "mvp_positions": mvp_detected,
+        "player_scores": player_scores,
         "img_width": img_width,
         "img_height": img_height
     }
@@ -1896,6 +1914,16 @@ def match_players(ocr_data: dict, linked_accounts: list) -> dict:
     all_texts = ocr_data["all_texts"]
     match_result = ocr_data["match_result"]
     mvp_positions = ocr_data["mvp_positions"]
+    player_scores = ocr_data.get("player_scores", [])
+
+    # Находим максимальную оценку на каждой стороне — это MVP
+    # Ключ: (side) -> {"score_val": ..., "center_y": ...}
+    max_score_by_side = {}
+    for ps in player_scores:
+        side = ps["side"]
+        if side not in max_score_by_side or ps["score_val"] > max_score_by_side[side]["score_val"]:
+            max_score_by_side[side] = ps
+    print(f"[OCR MVP Scores] Макс оценки по сторонам: { {k: v['score_val'] for k, v in max_score_by_side.items()} }")
     
     # Фильтруем текст: исключаем числа, слишком короткие строки и служебные слова
     skip_words = {"VICTORY", "DEFEAT", "MVP", "NEW", "ДАННЫЕ", "ВЫЙТИ", 
@@ -1945,16 +1973,24 @@ def match_players(ocr_data: dict, linked_accounts: list) -> dict:
             else:
                 is_winner = None
             
-            # Проверяем, рядом ли MVP
+            # Проверяем, является ли игрок MVP
             is_mvp = False
+            # Способ 1: по найденным текстовым значкам MVP рядом с ником
             if mvp_positions:
                 for mvp_pos in mvp_positions:
-                    # MVP и ник на одной стороне и близко по Y
                     if mvp_pos["side"] == side:
                         y_diff = abs(mvp_pos["center_y"] - best_match["center_y"])
-                        if y_diff < 80:
+                        if y_diff < 100:
                             is_mvp = True
+                            print(f"[OCR MVP] {nickname} — MVP по значку (y_diff={y_diff:.0f})")
                             break
+            # Способ 2 (резервный): если значок не найден — ищем по максимальной оценке на стороне
+            if not is_mvp and side in max_score_by_side:
+                best_score_on_side = max_score_by_side[side]
+                y_diff = abs(best_score_on_side["center_y"] - best_match["center_y"])
+                if y_diff < 60:
+                    is_mvp = True
+                    print(f"[OCR MVP] {nickname} — MVP по оценке {best_score_on_side['score_val']} (y_diff={y_diff:.0f})")
             
             matched_players.append({
                 "user_id": user_id,
