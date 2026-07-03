@@ -51,8 +51,39 @@ db_pool: asyncpg.Pool | None = None
 guild_settings_cache: dict[int, dict[str, int | None]] = {}
 
 # OCR-ридер (проверка наличия pytesseract)
+import urllib.request
 import pytesseract
-# Tesseract не требует ленивого тяжелого импорта, но мы обернем для совместимости
+
+# Создаем локальную директорию tessdata и скачиваем языковые пакеты при запуске, если нужно
+TESSDATA_DIR = Path(__file__).parent / "tessdata"
+TESSDATA_DIR.mkdir(exist_ok=True)
+
+def download_tessdata_files():
+    """Скачивает языковые файлы .traineddata, если они отсутствуют."""
+    langs = ["eng", "rus"]
+    for lang in langs:
+        file_path = TESSDATA_DIR / f"{lang}.traineddata"
+        if not file_path.exists():
+            url = f"https://github.com/tesseract-ocr/tessdoc/raw/main/dats/{lang}.traineddata"
+            # Если основной урл недоступен, попробуем зеркало/оф.репозиторий fast
+            if lang == "rus":
+                url = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/rus.traineddata"
+            elif lang == "eng":
+                url = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata"
+            
+            print(f"[OCR] Скачивание языковой модели Tesseract: {lang}...")
+            try:
+                urllib.request.urlretrieve(url, file_path)
+                print(f"[OCR] Успешно скачан {lang}.traineddata")
+            except Exception as e:
+                print(f"[OCR] Ошибка при скачивании {lang}: {e}")
+
+# Запускаем загрузку моделей при импорте
+download_tessdata_files()
+
+# Указываем pytesseract использовать локальную папку tessdata
+os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
+
 def get_ocr_reader():
     return pytesseract
 
@@ -1805,9 +1836,9 @@ async def analyze_screenshot(image_bytes: bytes) -> dict:
     img_width, img_height = img.size
     
     # Запускаем Tesseract OCR в отдельном потоке
-    # Используем комбинированный язык rus+eng
+    # Используем комбинированный язык rus+eng и указываем локальную папку tessdata
     def run_tesseract():
-        custom_config = r'--psm 11'
+        custom_config = f'--tessdata-dir "{TESSDATA_DIR}" --psm 11'
         return pytesseract.image_to_data(img, lang='rus+eng', output_type=pytesseract.Output.DICT, config=custom_config)
 
     data = await loop.run_in_executor(None, run_tesseract)

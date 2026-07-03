@@ -2,4 +2,4 @@
 MISE_PYTHON_GITHUB_ATTESTATIONS = "false"
 
 [phases.setup]
-aptPkgs = ["tesseract-ocr", "tesseract-ocr-rus", "tesseract-ocr-eng"]
+nixPkgs = ["tesseract"]
