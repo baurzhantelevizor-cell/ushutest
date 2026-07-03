@@ -130,6 +130,18 @@ async def init_db() -> asyncpg.Pool:
             );
             """
         )
+
+        # Таблица для связки Discord-аккаунта с игровым ником MLBB
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS linked_accounts (
+                user_id       BIGINT PRIMARY KEY,
+                game_nickname VARCHAR(100) NOT NULL,
+                game_id       VARCHAR(50),
+                linked_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
     return pool
 
 
@@ -1564,6 +1576,12 @@ async def cmd_profile(interaction: discord.Interaction, player: discord.Member |
             target.id
         )
 
+        # 4. Читаем привязанный игровой ник
+        linked_row = await conn.fetchrow(
+            "SELECT game_nickname, game_id FROM linked_accounts WHERE user_id = $1",
+            target.id
+        )
+
     # Дефолтные значения
     matches = 0
     wins = 0
@@ -1608,6 +1626,17 @@ async def cmd_profile(interaction: discord.Interaction, player: discord.Member |
     if target.avatar:
         embed.set_thumbnail(url=target.avatar.url)
 
+    # Привязанный ник MLBB
+    if linked_row:
+        game_nick = linked_row["game_nickname"]
+        game_id_val = linked_row["game_id"]
+        link_text = f"**{game_nick}**"
+        if game_id_val:
+            link_text += f" (ID: `{game_id_val}`)"
+        embed.add_field(name="🎮 Ник в MLBB", value=link_text, inline=False)
+    else:
+        embed.add_field(name="🎮 Ник в MLBB", value="_Не привязан · `/link`_", inline=False)
+
     embed.add_field(name="🎖️ ЭЛО Рейтинг", value=f"**{elo}**", inline=True)
     embed.add_field(name="🏆 Текущий Ранг", value=f"**{rank_name}**", inline=True)
     embed.add_field(name="🌟 Количество MVP", value=f"🏆 **{mvps}**", inline=True)
@@ -1622,6 +1651,72 @@ async def cmd_profile(interaction: discord.Interaction, player: discord.Member |
     embed.set_footer(text=f"ID: {target.id} · USHU TEST MLBB")
 
     await interaction.response.send_message(embed=embed)
+
+
+# ───────────── /link ──────────────────
+@bot.tree.command(name="link", description="Привязать свой игровой ник MLBB к Discord-аккаунту")
+@app_commands.describe(
+    nickname="Ваш ник в Mobile Legends (как отображается в игре)",
+    game_id="Ваш ID в игре (необязательно, например: 123456789)"
+)
+async def cmd_link(interaction: discord.Interaction, nickname: str, game_id: str | None = None):
+    if len(nickname) > 100:
+        await interaction.response.send_message(
+            "❌ Ник слишком длинный (макс. 100 символов).", ephemeral=True
+        )
+        return
+
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT game_nickname FROM linked_accounts WHERE user_id = $1",
+            interaction.user.id
+        )
+        
+        await conn.execute(
+            """
+            INSERT INTO linked_accounts (user_id, game_nickname, game_id) 
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE 
+            SET game_nickname = $2, game_id = $3, linked_at = CURRENT_TIMESTAMP
+            """,
+            interaction.user.id, nickname, game_id
+        )
+
+    id_text = f"\n🆔 ID в игре: **{game_id}**" if game_id else ""
+
+    if existing:
+        await interaction.response.send_message(
+            f"✅ Игровой ник обновлён!\n"
+            f"Старый ник: ~~{existing['game_nickname']}~~\n"
+            f"Новый ник: **{nickname}**{id_text}",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"✅ Аккаунт успешно привязан!\n"
+            f"🎮 Ник в MLBB: **{nickname}**{id_text}\n\n"
+            f"Теперь бот сможет распознавать вас на скриншотах результатов матча.",
+            ephemeral=True
+        )
+
+
+# ───────────── /unlink ────────────────
+@bot.tree.command(name="unlink", description="Отвязать игровой ник MLBB от Discord-аккаунта")
+async def cmd_unlink(interaction: discord.Interaction):
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM linked_accounts WHERE user_id = $1",
+            interaction.user.id
+        )
+    
+    if result == "DELETE 1":
+        await interaction.response.send_message(
+            "✅ Игровой ник успешно отвязан от вашего аккаунта.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "❌ У вас нет привязанного игрового ника. Используйте `/link` для привязки.", ephemeral=True
+        )
 
 
 # ───────────── /cancel ────────────────
