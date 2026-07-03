@@ -2128,6 +2128,10 @@ async def cmd_scan(interaction: discord.Interaction, screenshot: discord.Attachm
             )
             return
         
+        # Выводим в лог все распознанные слова для отладки
+        raw_words = [t["text"] for t in ocr_data["all_texts"]]
+        print(f"[OCR DEBUG] Все распознанные слова: {raw_words}")
+        
         # Сопоставляем
         results = match_players(ocr_data, linked_accounts)
         
