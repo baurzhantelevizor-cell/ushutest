@@ -102,6 +102,34 @@ async def init_db() -> asyncpg.Pool:
             );
             """
         )
+
+        # Таблица для накопления общей статистики игроков
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS player_stats (
+                user_id    BIGINT PRIMARY KEY,
+                matches    INTEGER NOT NULL DEFAULT 0,
+                wins       INTEGER NOT NULL DEFAULT 0,
+                losses     INTEGER NOT NULL DEFAULT 0,
+                mvps       INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+
+        # Таблица для записи истории матчей (для вывода последних 5 героев)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS match_history (
+                id          SERIAL PRIMARY KEY,
+                user_id     BIGINT NOT NULL,
+                match_id    VARCHAR(100) NOT NULL,
+                hero_name   VARCHAR(100) NOT NULL,
+                role        VARCHAR(50) NOT NULL,
+                is_win      BOOLEAN NOT NULL,
+                match_date  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
     return pool
 
 
@@ -1005,7 +1033,7 @@ class AutoWinPollView(discord.ui.View):
         async with db_pool.acquire() as conn:
             players = await conn.fetch(
                 """
-                SELECT user_id, team_name, is_ranked 
+                SELECT user_id, team_name, is_ranked, hero_name, role, match_id 
                 FROM active_match_heroes 
                 WHERE guild_id = $1
                 """,
@@ -1024,11 +1052,18 @@ class AutoWinPollView(discord.ui.View):
                 return
 
             if is_ranked_match:
-                winners_ids = [p["user_id"] for p in players if p["team_name"] == winner_team_val]
-                losers_ids = [p["user_id"] for p in players if p["team_name"] != winner_team_val]
+                winners = [p for p in players if p["team_name"] == winner_team_val]
+                losers = [p for p in players if p["team_name"] != winner_team_val]
+                
+                winners_ids = [p["user_id"] for p in winners]
+                losers_ids = [p["user_id"] for p in losers]
 
-                # Победителям +50 ЭЛО
-                for uid in winners_ids:
+                # Победителям +50 ЭЛО, +1 к матчам, +1 к победам
+                for p in winners:
+                    uid = p["user_id"]
+                    hero = p["hero_name"]
+                    role = p["role"]
+                    m_id = p["match_id"]
                     await conn.execute(
                         """
                         INSERT INTO players (user_id, elo) VALUES ($1, $2)
@@ -1036,15 +1071,47 @@ class AutoWinPollView(discord.ui.View):
                         """,
                         uid, DEFAULT_ELO + 50
                     )
+                    await conn.execute(
+                        """
+                        INSERT INTO player_stats (user_id, matches, wins, losses, mvps) VALUES ($1, 1, 1, 0, 0)
+                        ON CONFLICT (user_id) DO UPDATE SET matches = player_stats.matches + 1, wins = player_stats.wins + 1
+                        """,
+                        uid
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO match_history (user_id, match_id, hero_name, role, is_win)
+                        VALUES ($1, $2, $3, $4, TRUE)
+                        """,
+                        uid, m_id, hero, role
+                    )
                 
-                # Проигравшим -50 ЭЛО (но не ниже 0)
-                for uid in losers_ids:
+                # Проигравшим -50 ЭЛО (но не ниже 0), +1 к матчам, +1 к поражениям
+                for p in losers:
+                    uid = p["user_id"]
+                    hero = p["hero_name"]
+                    role = p["role"]
+                    m_id = p["match_id"]
                     await conn.execute(
                         """
                         INSERT INTO players (user_id, elo) VALUES ($1, $2)
                         ON CONFLICT (user_id) DO UPDATE SET elo = GREATEST(players.elo - 50, 0)
                         """,
                         uid, DEFAULT_ELO - 50
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO player_stats (user_id, matches, wins, losses, mvps) VALUES ($1, 1, 0, 1, 0)
+                        ON CONFLICT (user_id) DO UPDATE SET matches = player_stats.matches + 1, losses = player_stats.losses + 1
+                        """,
+                        uid
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO match_history (user_id, match_id, hero_name, role, is_win)
+                        VALUES ($1, $2, $3, $4, FALSE)
+                        """,
+                        uid, m_id, hero, role
                     )
 
                 await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", self.guild_id)
@@ -1453,6 +1520,110 @@ async def cmd_top(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+# ───────────── /profile ─────────────────
+@bot.tree.command(name="profile", description="Посмотреть профиль, ЭЛО и подробную статистику игрока")
+@app_commands.describe(player="Игрок, профиль которого нужно посмотреть (по умолчанию — ваш собственный)")
+async def cmd_profile(interaction: discord.Interaction, player: discord.Member | None = None):
+    target = player if player else interaction.user
+    
+    # 1. Получаем текущее ЭЛО
+    elo = await get_elo(target.id)
+
+    # Определяем лигу по ЭЛО
+    if elo < 200:
+        rank_name = "🟫 Воин"
+    elif elo < 400:
+        rank_name = "🥈 Элита"
+    elif elo < 600:
+        rank_name = "🥇 Мастер"
+    elif elo < 800:
+        rank_name = "🛡️ Грандмастер"
+    elif elo < 1000:
+        rank_name = "🔮 Эпик"
+    elif elo < 1200:
+        rank_name = "👑 Легенда"
+    else:
+        rank_name = "🌟 Мифическая Слава"
+
+    # 2. Читаем общую статистику из player_stats
+    async with db_pool.acquire() as conn:
+        stats_row = await conn.fetchrow(
+            "SELECT matches, wins, losses, mvps FROM player_stats WHERE user_id = $1",
+            target.id
+        )
+        
+        # 3. Читаем историю последних 5 героев
+        history_rows = await conn.fetch(
+            """
+            SELECT hero_name, role, is_win 
+            FROM match_history 
+            WHERE user_id = $1 
+            ORDER BY match_date DESC 
+            LIMIT 5
+            """,
+            target.id
+        )
+
+    # Дефолтные значения
+    matches = 0
+    wins = 0
+    losses = 0
+    mvps = 0
+    winrate = 0.0
+
+    if stats_row:
+        matches = stats_row["matches"]
+        wins = stats_row["wins"]
+        losses = stats_row["losses"]
+        mvps = stats_row["mvps"]
+        if matches > 0:
+            winrate = (wins / matches) * 100
+
+    role_emojis = {
+        "gold": "🪙 Gold",
+        "exp": "🛡️ Exp",
+        "mid": "🔮 Mid",
+        "jungle": "⚔️ Jungle",
+        "roam": "👣 Roam"
+    }
+
+    # Строим список последних игр
+    history_lines = []
+    if history_rows:
+        for r in history_rows:
+            h_name = r["hero_name"]
+            role_val = r["role"]
+            is_win = r["is_win"]
+            role_lbl = role_emojis.get(role_val, role_val.capitalize())
+            status_emoji = "🟢 Win" if is_win else "🔴 Loss"
+            
+            history_lines.append(f"{status_emoji} · **{h_name}** ({role_lbl})")
+    else:
+        history_lines.append("_Игр пока нет_")
+
+    embed = discord.Embed(
+        title=f"👤 ПРОФИЛЬ ИГРОКА — {target.display_name}",
+        color=0x5865F2
+    )
+    if target.avatar:
+        embed.set_thumbnail(url=target.avatar.url)
+
+    embed.add_field(name="🎖️ ЭЛО Рейтинг", value=f"**{elo}**", inline=True)
+    embed.add_field(name="🏆 Текущий Ранг", value=f"**{rank_name}**", inline=True)
+    embed.add_field(name="🌟 Количество MVP", value=f"🏆 **{mvps}**", inline=True)
+
+    stats_block = (
+        f"🎮 Сыграно матчей: **{matches}**\n"
+        f"📈 Процент побед: **{winrate:.1f}%**\n"
+        f"🟢 Победы: **{wins}** · 🔴 Поражения: **{losses}**"
+    )
+    embed.add_field(name="📊 Игровая Статистика", value=stats_block, inline=False)
+    embed.add_field(name="⏳ Последние 5 игр", value="\n".join(history_lines), inline=False)
+    embed.set_footer(text=f"ID: {target.id} · USHU TEST MLBB")
+
+    await interaction.response.send_message(embed=embed)
+
+
 # ───────────── /cancel ────────────────
 @bot.tree.command(name="cancel", description="Отменить текущий сбор на матч")
 @app_commands.default_permissions(administrator=True)
@@ -1639,7 +1810,7 @@ async def cmd_win_team(interaction: discord.Interaction, team: app_commands.Choi
     async with db_pool.acquire() as conn:
         players = await conn.fetch(
             """
-            SELECT user_id, team_name, is_ranked 
+            SELECT user_id, team_name, is_ranked, hero_name, role, match_id 
             FROM active_match_heroes 
             WHERE guild_id = $1
             """,
@@ -1664,11 +1835,18 @@ async def cmd_win_team(interaction: discord.Interaction, team: app_commands.Choi
             return
 
         if is_ranked_match:
-            winners_ids = [p["user_id"] for p in players if p["team_name"] == winner_team_val]
-            losers_ids = [p["user_id"] for p in players if p["team_name"] != winner_team_val]
+            winners = [p for p in players if p["team_name"] == winner_team_val]
+            losers = [p for p in players if p["team_name"] != winner_team_val]
+            
+            winners_ids = [p["user_id"] for p in winners]
+            losers_ids = [p["user_id"] for p in losers]
 
-            # Победителям +50 ЭЛО
-            for uid in winners_ids:
+            # Победителям +50 ЭЛО, +1 к матчам, +1 к победам
+            for p in winners:
+                uid = p["user_id"]
+                hero = p["hero_name"]
+                role = p["role"]
+                m_id = p["match_id"]
                 await conn.execute(
                     """
                     INSERT INTO players (user_id, elo) VALUES ($1, $2)
@@ -1676,15 +1854,47 @@ async def cmd_win_team(interaction: discord.Interaction, team: app_commands.Choi
                     """,
                     uid, DEFAULT_ELO + 50
                 )
+                await conn.execute(
+                    """
+                    INSERT INTO player_stats (user_id, matches, wins, losses, mvps) VALUES ($1, 1, 1, 0, 0)
+                    ON CONFLICT (user_id) DO UPDATE SET matches = player_stats.matches + 1, wins = player_stats.wins + 1
+                    """,
+                    uid
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO match_history (user_id, match_id, hero_name, role, is_win)
+                    VALUES ($1, $2, $3, $4, TRUE)
+                    """,
+                    uid, m_id, hero, role
+                )
             
-            # Проигравшим -50 ЭЛО (но не ниже 0)
-            for uid in losers_ids:
+            # Проигравшим -50 ЭЛО (но не ниже 0), +1 к матчам, +1 к поражениям
+            for p in losers:
+                uid = p["user_id"]
+                hero = p["hero_name"]
+                role = p["role"]
+                m_id = p["match_id"]
                 await conn.execute(
                     """
                     INSERT INTO players (user_id, elo) VALUES ($1, $2)
                     ON CONFLICT (user_id) DO UPDATE SET elo = GREATEST(players.elo - 50, 0)
                     """,
                     uid, DEFAULT_ELO - 50
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO player_stats (user_id, matches, wins, losses, mvps) VALUES ($1, 1, 0, 1, 0)
+                    ON CONFLICT (user_id) DO UPDATE SET matches = player_stats.matches + 1, losses = player_stats.losses + 1
+                    """,
+                    uid
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO match_history (user_id, match_id, hero_name, role, is_win)
+                    VALUES ($1, $2, $3, $4, FALSE)
+                    """,
+                    uid, m_id, hero, role
                 )
             
             await conn.execute("DELETE FROM active_match_heroes WHERE guild_id = $1", guild_id)
@@ -1719,6 +1929,13 @@ async def cmd_mvp_win(interaction: discord.Interaction, player: discord.Member):
             """,
             player.id, DEFAULT_ELO + 25
         )
+        await conn.execute(
+            """
+            INSERT INTO player_stats (user_id, mvps) VALUES ($1, 1)
+            ON CONFLICT (user_id) DO UPDATE SET mvps = player_stats.mvps + 1
+            """,
+            player.id
+        )
     await interaction.response.send_message(
         f"🌟 **MVP победителей!** Игрок {player.mention} получает **+25 ЭЛО**!"
     )
@@ -1739,6 +1956,13 @@ async def cmd_mvp_loss(interaction: discord.Interaction, player: discord.Member)
             ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 25
             """,
             player.id, DEFAULT_ELO + 25
+        )
+        await conn.execute(
+            """
+            INSERT INTO player_stats (user_id, mvps) VALUES ($1, 1)
+            ON CONFLICT (user_id) DO UPDATE SET mvps = player_stats.mvps + 1
+            """,
+            player.id
         )
     await interaction.response.send_message(
         f"🌟 **MVP проигравших!** Игрок {player.mention} получает **+25 ЭЛО**!"
