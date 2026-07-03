@@ -1851,14 +1851,20 @@ async def analyze_screenshot(image_bytes: bytes) -> dict:
     loop = asyncio.get_event_loop()
     
     # Открываем изображение
-    img = Image.open(io.BytesIO(image_bytes))
-    img_width, img_height = img.size
+    original_img = Image.open(io.BytesIO(image_bytes))
+    img_width, img_height = original_img.size
+    
+    # ПРЕДОБРАБОТКА ДЛЯ ЛУЧШЕГО РАСПОЗНАВАНИЯ МЕЛКОГО ШРИФТА:
+    # 1. Увеличиваем изображение в 2 раза для четкости
+    resized_img = original_img.resize((img_width * 2, img_height * 2), Image.Resampling.LANCZOS)
+    # 2. Конвертируем в градации серого (убирает влияние цветных клан-тегов)
+    processed_img = resized_img.convert("L")
     
     # Запускаем Tesseract OCR в отдельном потоке
     # Используем комбинированный язык rus+eng и указываем локальную папку tessdata
     def run_tesseract():
         custom_config = f'--tessdata-dir "{TESSDATA_DIR}" --psm 11'
-        return pytesseract.image_to_data(img, lang='rus+eng', output_type=pytesseract.Output.DICT, config=custom_config)
+        return pytesseract.image_to_data(processed_img, lang='rus+eng', output_type=pytesseract.Output.DICT, config=custom_config)
 
     data = await loop.run_in_executor(None, run_tesseract)
     
@@ -1876,15 +1882,16 @@ async def analyze_screenshot(image_bytes: bytes) -> dict:
         w = data['width'][i]
         h = data['height'][i]
         
-        center_x = x + w / 2
-        center_y = y + h / 2
+        # Делим координаты на 2, чтобы вернуть их к исходному размеру скриншота
+        center_x = (x + w / 2) / 2.0
+        center_y = (y + h / 2) / 2.0
         
         all_texts.append({
             "text": text,
             "confidence": conf / 100.0,
             "center_x": center_x,
             "center_y": center_y,
-            "side": "left" if center_x < img_width / 2 else "right"
+            "side": "left" if center_x < img_width else "right"
         })
     
     # Определяем результат матча (VICTORY / DEFEAT / ПОБЕДА)
