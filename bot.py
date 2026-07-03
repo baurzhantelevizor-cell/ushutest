@@ -84,6 +84,43 @@ download_tessdata_files()
 # Указываем pytesseract использовать локальную папку tessdata
 os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
 
+# Настройка пути к исполняемому файлу tesseract
+def find_tesseract_cmd():
+    # 1. Попробуем найти через shutil.which
+    import shutil
+    path = shutil.which("tesseract")
+    if path:
+        return path
+    
+    # 2. Поищем в стандартных местах Unix/Railway
+    custom_paths = [
+        "/usr/bin/tesseract",
+        "/usr/local/bin/tesseract",
+        "/nix/var/nix/profiles/default/bin/tesseract"
+    ]
+    for p in custom_paths:
+        if os.path.exists(p):
+            return p
+            
+    # 3. Сканируем /nix/store на наличие tesseract
+    # В Railway nix-пакеты лежат в /nix/store/
+    if os.path.exists("/nix/store"):
+        try:
+            for item in os.listdir("/nix/store"):
+                # Ищем папку tesseract-*
+                if item.startswith("tesseract-") and not item.endswith(".drv"):
+                    bin_path = os.path.join("/nix/store", item, "bin", "tesseract")
+                    if os.path.exists(bin_path):
+                        return bin_path
+        except Exception:
+            pass
+            
+    return "tesseract" # Дефолтное значение
+
+tesseract_path = find_tesseract_cmd()
+print(f"[OCR] Найден путь к Tesseract: {tesseract_path}")
+pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
 def get_ocr_reader():
     return pytesseract
 
