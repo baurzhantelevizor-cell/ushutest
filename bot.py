@@ -50,61 +50,16 @@ db_pool: asyncpg.Pool | None = None
 # Кэш настроек гильдии: guild_id → {voice_channel_id, ready_channel_id, voice_team1_id, voice_team2_id, host_role_id}
 guild_settings_cache: dict[int, dict[str, int | None]] = {}
 
-# OCR-ридер (проверка наличия pytesseract)
-import urllib.request
-import pytesseract
-
-# Создаем локальную директорию tessdata и скачиваем языковые пакеты при запуске, если нужно
-TESSDATA_DIR = Path(__file__).parent / "tessdata"
-TESSDATA_DIR.mkdir(exist_ok=True)
-
-def download_tessdata_files():
-    """Скачивает языковые файлы .traineddata, если они отсутствуют."""
-    langs = ["eng", "rus"]
-    for lang in langs:
-        file_path = TESSDATA_DIR / f"{lang}.traineddata"
-        if not file_path.exists():
-            url = f"https://github.com/tesseract-ocr/tessdoc/raw/main/dats/{lang}.traineddata"
-            # Если основной урл недоступен, попробуем зеркало/оф.репозиторий fast
-            if lang == "rus":
-                url = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/rus.traineddata"
-            elif lang == "eng":
-                url = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata"
-            
-            print(f"[OCR] Скачивание языковой модели Tesseract: {lang}...")
-            try:
-                urllib.request.urlretrieve(url, file_path)
-                print(f"[OCR] Успешно скачан {lang}.traineddata")
-            except Exception as e:
-                print(f"[OCR] Ошибка при скачивании {lang}: {e}")
-
-# Запускаем загрузку моделей при импорте
-download_tessdata_files()
-
-# Указываем pytesseract использовать локальную папку tessdata
-os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
-
-# Настройка пути к исполняемому файлу tesseract
-def find_tesseract_cmd():
-    import shutil
-    path = shutil.which("tesseract")
-    if path:
-        return path
-    
-    # Стандартный путь в Debian/Ubuntu при установке через apt
-    if os.path.exists("/usr/bin/tesseract"):
-        return "/usr/bin/tesseract"
-    if os.path.exists("/usr/local/bin/tesseract"):
-        return "/usr/local/bin/tesseract"
-            
-    return "tesseract"
-
-tesseract_path = find_tesseract_cmd()
-print(f"[OCR] Найден путь к Tesseract: {tesseract_path}")
-pytesseract.pytesseract.tesseract_cmd = tesseract_path
+# OCR-ридер (ленивая инициализация при первом вызове /scan)
+ocr_reader = None
 
 def get_ocr_reader():
-    return pytesseract
+    """Ленивая инициализация EasyOCR ридера."""
+    global ocr_reader
+    if ocr_reader is None:
+        import easyocr
+        ocr_reader = easyocr.Reader(["ru", "en"], gpu=False)
+    return ocr_reader
 
 
 # ═══════════════════════════ DATABASE ════════════════════════════
