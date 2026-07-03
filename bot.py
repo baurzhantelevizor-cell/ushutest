@@ -7,13 +7,18 @@ Discord-бот для кастомных матчей 5x5 в Mobile Legends.
 import os
 import random
 import asyncio
+import io
 from pathlib import Path
+from difflib import SequenceMatcher
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 import asyncpg
 from dotenv import load_dotenv
+import aiohttp
+import numpy as np
+from PIL import Image
 
 # Импортируем маппинг ролей героев
 try:
@@ -44,6 +49,17 @@ db_pool: asyncpg.Pool | None = None
 
 # Кэш настроек гильдии: guild_id → {voice_channel_id, ready_channel_id, voice_team1_id, voice_team2_id, host_role_id}
 guild_settings_cache: dict[int, dict[str, int | None]] = {}
+
+# OCR-ридер (ленивая инициализация при первом вызове /scan)
+ocr_reader = None
+
+def get_ocr_reader():
+    """Ленивая инициализация EasyOCR ридера."""
+    global ocr_reader
+    if ocr_reader is None:
+        import easyocr
+        ocr_reader = easyocr.Reader(["ru", "en"], gpu=False)
+    return ocr_reader
 
 
 # ═══════════════════════════ DATABASE ════════════════════════════
@@ -1762,6 +1778,406 @@ async def cmd_link_admin(interaction: discord.Interaction, player: discord.Membe
         await interaction.response.send_message(
             f"✅ Аккаунт {player.mention} успешно привязан!\n"
             f"🎮 Ник в MLBB: **{nickname}**{id_text}"
+        )
+
+
+
+# ═══════════════════════════ OCR SCAN ════════════════════════════
+
+def fuzzy_match(ocr_text: str, nickname: str) -> float:
+    """Нечёткое сравнение OCR-текста с ником из базы."""
+    ocr_clean = ocr_text.lower().strip()
+    nick_clean = nickname.lower().strip()
+    
+    # Точное совпадение
+    if ocr_clean == nick_clean:
+        return 1.0
+    
+    # Проверяем, содержится ли ник в тексте или наоборот
+    if nick_clean in ocr_clean or ocr_clean in nick_clean:
+        return 0.9
+    
+    # Нечёткое сравнение
+    return SequenceMatcher(None, ocr_clean, nick_clean).ratio()
+
+
+async def analyze_screenshot(image_bytes: bytes) -> dict:
+    """Анализирует скриншот MLBB и извлекает данные."""
+    loop = asyncio.get_event_loop()
+    
+    # Открываем изображение
+    img = Image.open(io.BytesIO(image_bytes))
+    img_width, img_height = img.size
+    img_array = np.array(img)
+    
+    # Запускаем OCR в отдельном потоке (чтобы не блокировать бота)
+    reader = get_ocr_reader()
+    results = await loop.run_in_executor(None, lambda: reader.readtext(img_array))
+    
+    # Собираем все распознанные тексты с координатами
+    all_texts = []
+    for (bbox, text, conf) in results:
+        # bbox = [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+        center_x = sum(p[0] for p in bbox) / 4
+        center_y = sum(p[1] for p in bbox) / 4
+        all_texts.append({
+            "text": text,
+            "confidence": conf,
+            "center_x": center_x,
+            "center_y": center_y,
+            "side": "left" if center_x < img_width / 2 else "right"
+        })
+    
+    # Определяем результат матча (VICTORY / DEFEAT)
+    match_result = None
+    for t in all_texts:
+        text_upper = t["text"].upper()
+        if "VICTORY" in text_upper or "ПОБЕДА" in text_upper:
+            match_result = "victory"
+            break
+        elif "DEFEAT" in text_upper or "ПОРАЖЕН" in text_upper:
+            match_result = "defeat"
+            break
+    
+    # Определяем MVP
+    mvp_detected = []
+    for t in all_texts:
+        if "MVP" in t["text"].upper():
+            mvp_detected.append(t)
+    
+    return {
+        "all_texts": all_texts,
+        "match_result": match_result,
+        "mvp_positions": mvp_detected,
+        "img_width": img_width,
+        "img_height": img_height
+    }
+
+
+def match_players(ocr_data: dict, linked_accounts: list) -> dict:
+    """Сопоставляет OCR-тексты с привязанными никами."""
+    all_texts = ocr_data["all_texts"]
+    match_result = ocr_data["match_result"]
+    mvp_positions = ocr_data["mvp_positions"]
+    
+    # Фильтруем текст: исключаем числа, слишком короткие строки и служебные слова
+    skip_words = {"VICTORY", "DEFEAT", "MVP", "NEW", "ДАННЫЕ", "ВЫЙТИ", 
+                  "ЛАЙК", "ВСЕМ", "БЫСТРЫЙ", "ЧАТ", "БОЕВОЙ", "ДЛИТЕЛЬНОСТЬ",
+                  "Ты", "замечательный", "противник", "Длительность"}
+    
+    candidate_texts = []
+    for t in all_texts:
+        text = t["text"].strip()
+        # Пропускаем чистые числа, слишком короткие, и служебные слова
+        if len(text) < 2:
+            continue
+        if text.replace(".", "").replace(",", "").replace(" ", "").isdigit():
+            continue
+        if text.upper() in skip_words:
+            continue
+        if any(sw.lower() in text.lower() for sw in skip_words):
+            continue
+        candidate_texts.append(t)
+    
+    # Сопоставляем каждый привязанный ник с найденными текстами
+    matched_players = []
+    unmatched_linked = []
+    
+    for acc in linked_accounts:
+        nickname = acc["game_nickname"]
+        user_id = acc["user_id"]
+        
+        best_match = None
+        best_score = 0.0
+        
+        for t in candidate_texts:
+            score = fuzzy_match(t["text"], nickname)
+            if score > best_score:
+                best_score = score
+                best_match = t
+        
+        if best_score >= 0.55 and best_match:
+            # Определяем сторону: left = "Команда 1", right = "Команда 2"
+            side = best_match["side"]
+            
+            # Определяем, победитель или проигравший
+            if match_result == "victory":
+                is_winner = (side == "left")
+            elif match_result == "defeat":
+                is_winner = (side == "right")
+            else:
+                is_winner = None
+            
+            # Проверяем, рядом ли MVP
+            is_mvp = False
+            if mvp_positions:
+                for mvp_pos in mvp_positions:
+                    # MVP и ник на одной стороне и близко по Y
+                    if mvp_pos["side"] == side:
+                        y_diff = abs(mvp_pos["center_y"] - best_match["center_y"])
+                        if y_diff < 80:
+                            is_mvp = True
+                            break
+            
+            matched_players.append({
+                "user_id": user_id,
+                "game_nickname": nickname,
+                "ocr_text": best_match["text"],
+                "match_score": best_score,
+                "side": side,
+                "is_winner": is_winner,
+                "is_mvp": is_mvp
+            })
+        else:
+            unmatched_linked.append({
+                "user_id": user_id,
+                "game_nickname": nickname,
+                "best_score": best_score
+            })
+    
+    return {
+        "matched": matched_players,
+        "unmatched": unmatched_linked,
+        "match_result": match_result,
+        "total_ocr_texts": len(candidate_texts)
+    }
+
+
+class ScanConfirmView(discord.ui.View):
+    """Кнопки подтверждения/отмены результатов OCR-анализа."""
+    
+    def __init__(self, matched_players: list, guild_id: int):
+        super().__init__(timeout=120)
+        self.matched_players = matched_players
+        self.guild_id = guild_id
+    
+    @discord.ui.button(label="✅ Подтвердить и начислить", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Только админ может подтвердить.", ephemeral=True)
+            return
+        
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+        
+        winners = [p for p in self.matched_players if p["is_winner"] is True]
+        losers = [p for p in self.matched_players if p["is_winner"] is False]
+        mvps = [p for p in self.matched_players if p.get("is_mvp")]
+        
+        async with db_pool.acquire() as conn:
+            # Начисляем ЭЛО победителям
+            for p in winners:
+                uid = p["user_id"]
+                await conn.execute(
+                    """
+                    INSERT INTO players (user_id, elo) VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 50
+                    """,
+                    uid, DEFAULT_ELO + 50
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO player_stats (user_id, matches, wins, losses, mvps) VALUES ($1, 1, 1, 0, 0)
+                    ON CONFLICT (user_id) DO UPDATE SET matches = player_stats.matches + 1, wins = player_stats.wins + 1
+                    """,
+                    uid
+                )
+            
+            # Снимаем ЭЛО у проигравших
+            for p in losers:
+                uid = p["user_id"]
+                await conn.execute(
+                    """
+                    INSERT INTO players (user_id, elo) VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO UPDATE SET elo = GREATEST(players.elo - 50, 0)
+                    """,
+                    uid, DEFAULT_ELO - 50
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO player_stats (user_id, matches, wins, losses, mvps) VALUES ($1, 1, 0, 1, 0)
+                    ON CONFLICT (user_id) DO UPDATE SET matches = player_stats.matches + 1, losses = player_stats.losses + 1
+                    """,
+                    uid
+                )
+            
+            # Начисляем MVP бонус
+            for p in mvps:
+                uid = p["user_id"]
+                await conn.execute(
+                    """
+                    INSERT INTO players (user_id, elo) VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO UPDATE SET elo = players.elo + 25
+                    """,
+                    uid, DEFAULT_ELO + 25
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO player_stats (user_id, mvps) VALUES ($1, 1)
+                    ON CONFLICT (user_id) DO UPDATE SET mvps = player_stats.mvps + 1
+                    """,
+                    uid
+                )
+        
+        # Формируем итоговое сообщение
+        result_lines = []
+        if winners:
+            w_mentions = " ".join(f"<@{p['user_id']}>" for p in winners)
+            result_lines.append(f"🟢 **Победители (+50 ЭЛО):**\n{w_mentions}")
+        if losers:
+            l_mentions = " ".join(f"<@{p['user_id']}>" for p in losers)
+            result_lines.append(f"🔴 **Проигравшие (-50 ЭЛО):**\n{l_mentions}")
+        if mvps:
+            m_mentions = " ".join(f"<@{p['user_id']}>" for p in mvps)
+            result_lines.append(f"🌟 **MVP (+25 ЭЛО):**\n{m_mentions}")
+        
+        await interaction.followup.send(
+            f"✅ **Результаты матча применены по скриншоту!**\n\n" + "\n\n".join(result_lines)
+        )
+    
+    @discord.ui.button(label="❌ Отмена", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Только админ может отменить.", ephemeral=True)
+            return
+        
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content="❌ **Анализ скриншота отменён.** Результаты не были применены.",
+            view=self
+        )
+
+
+# ───────────── /scan ──────────────────
+@bot.tree.command(name="scan", description="[Админ] Сканировать скриншот результатов матча MLBB и начислить ЭЛО")
+@app_commands.describe(screenshot="Скриншот с результатами матча MLBB")
+@app_commands.default_permissions(administrator=True)
+async def cmd_scan(interaction: discord.Interaction, screenshot: discord.Attachment):
+    # Проверяем, что это изображение
+    if not screenshot.content_type or not screenshot.content_type.startswith("image/"):
+        await interaction.response.send_message(
+            "❌ Прикрепите изображение (скриншот результатов матча).", ephemeral=True
+        )
+        return
+    
+    await interaction.response.defer(thinking=True)
+    
+    try:
+        # Скачиваем изображение
+        image_bytes = await screenshot.read()
+        
+        # Анализируем скриншот
+        ocr_data = await analyze_screenshot(image_bytes)
+        
+        # Загружаем все привязанные аккаунты с сервера
+        async with db_pool.acquire() as conn:
+            linked_accounts = await conn.fetch(
+                """
+                SELECT la.user_id, la.game_nickname 
+                FROM linked_accounts la
+                """
+            )
+        
+        if not linked_accounts:
+            await interaction.followup.send(
+                "❌ В базе нет привязанных аккаунтов. Игроки должны использовать `/link` для привязки ников.",
+                ephemeral=True
+            )
+            return
+        
+        # Сопоставляем
+        results = match_players(ocr_data, linked_accounts)
+        
+        # Строим красивый Embed с результатами
+        match_status = "🟢 ПОБЕДА (VICTORY)" if results["match_result"] == "victory" else (
+            "🔴 ПОРАЖЕНИЕ (DEFEAT)" if results["match_result"] == "defeat" else "❓ Не удалось определить"
+        )
+        
+        embed = discord.Embed(
+            title="🔍 АНАЛИЗ СКРИНШОТА MLBB",
+            description=f"**Результат матча:** {match_status}",
+            color=0x00FF00 if results["match_result"] == "victory" else (
+                0xFF0000 if results["match_result"] == "defeat" else 0xFFFF00
+            )
+        )
+        embed.set_thumbnail(url=screenshot.url)
+        
+        # Найденные игроки
+        if results["matched"]:
+            winners_lines = []
+            losers_lines = []
+            
+            for p in results["matched"]:
+                member = interaction.guild.get_member(p["user_id"])
+                name = member.mention if member else f"<@{p['user_id']}>"
+                accuracy = f"{p['match_score']*100:.0f}%"
+                mvp_badge = " 🌟MVP" if p.get("is_mvp") else ""
+                ocr_hint = f" _(OCR: «{p['ocr_text']}»)_" if p['match_score'] < 0.95 else ""
+                
+                line = f"{name} — `{p['game_nickname']}`{mvp_badge} ({accuracy}){ocr_hint}"
+                
+                if p["is_winner"] is True:
+                    winners_lines.append(f"🟢 {line}")
+                elif p["is_winner"] is False:
+                    losers_lines.append(f"🔴 {line}")
+                else:
+                    winners_lines.append(f"❓ {line}")
+            
+            if winners_lines:
+                embed.add_field(
+                    name="🏆 Победители (+50 ЭЛО)",
+                    value="\n".join(winners_lines),
+                    inline=False
+                )
+            if losers_lines:
+                embed.add_field(
+                    name="💀 Проигравшие (-50 ЭЛО)",
+                    value="\n".join(losers_lines),
+                    inline=False
+                )
+        else:
+            embed.add_field(
+                name="⚠️ Игроки не найдены",
+                value="Ни один привязанный ник не совпал с текстом на скриншоте.\n"
+                      "Убедитесь, что игроки привязали ники через `/link`.",
+                inline=False
+            )
+        
+        # Ненайденные привязанные аккаунты
+        if results["unmatched"]:
+            unmatched_lines = []
+            for u in results["unmatched"][:5]:
+                member = interaction.guild.get_member(u["user_id"])
+                name = member.mention if member else f"<@{u['user_id']}>"
+                unmatched_lines.append(f"❓ {name} — `{u['game_nickname']}`")
+            embed.add_field(
+                name="📋 Не найдены на скриншоте",
+                value="\n".join(unmatched_lines),
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Распознано {len(ocr_data['all_texts'])} текстовых элементов · EasyOCR")
+        
+        # Если есть совпадения — показываем кнопки подтверждения
+        if results["matched"] and results["match_result"]:
+            view = ScanConfirmView(results["matched"], interaction.guild_id)
+            await interaction.followup.send(
+                "📋 **Проверьте результаты анализа и подтвердите начисление ЭЛО:**",
+                embed=embed,
+                view=view
+            )
+        else:
+            await interaction.followup.send(
+                "⚠️ **Результаты анализа (автоматическое начисление невозможно):**",
+                embed=embed
+            )
+    
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Ошибка при анализе скриншота: ```{str(e)[:500]}```",
+            ephemeral=True
         )
 
 
