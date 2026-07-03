@@ -86,39 +86,18 @@ os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
 
 # Настройка пути к исполняемому файлу tesseract
 def find_tesseract_cmd():
-    print(f"[OCR] Текущий PATH: {os.environ.get('PATH')}")
-    # 1. Попробуем найти через shutil.which
     import shutil
     path = shutil.which("tesseract")
     if path:
         return path
     
-    # 2. Поищем в стандартных местах Unix/Railway
-    custom_paths = [
-        "/usr/bin/tesseract",
-        "/usr/local/bin/tesseract",
-        "/nix/var/nix/profiles/default/bin/tesseract"
-    ]
-    for p in custom_paths:
-        if os.path.exists(p):
-            return p
+    # Стандартный путь в Debian/Ubuntu при установке через apt
+    if os.path.exists("/usr/bin/tesseract"):
+        return "/usr/bin/tesseract"
+    if os.path.exists("/usr/local/bin/tesseract"):
+        return "/usr/local/bin/tesseract"
             
-    # 3. Сканируем /nix/store на наличие tesseract
-    # В Railway nix-пакеты лежат в /nix/store/
-    if os.path.exists("/nix/store"):
-        try:
-            items = os.listdir("/nix/store")
-            print(f"[OCR] Элементы /nix/store (первые 50): {items[:50]}")
-            for item in items:
-                # Ищем папку tesseract-*
-                if "tesseract-" in item and not item.endswith(".drv"):
-                    bin_path = os.path.join("/nix/store", item, "bin", "tesseract")
-                    if os.path.exists(bin_path):
-                        return bin_path
-        except Exception as e:
-            print(f"[OCR] Ошибка сканирования /nix/store: {e}")
-            
-    return "tesseract" # Дефолтное значение
+    return "tesseract"
 
 tesseract_path = find_tesseract_cmd()
 print(f"[OCR] Найден путь к Tesseract: {tesseract_path}")
