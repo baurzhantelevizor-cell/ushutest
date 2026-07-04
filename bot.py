@@ -2052,29 +2052,30 @@ def match_players(ocr_data: dict, linked_accounts: list) -> dict:
                 "best_score": best_score
             })
     
-    # ── Назначаем MVP: только ОДИН игрок на каждой стороне ──────────────────
-    # Метод 1: по template matching / OCR-значку MVP — берём ближайшего на стороне
-    if mvp_positions:
-        for mvp_pos in mvp_positions:
-            side = mvp_pos["side"]
-            candidates = [p for p in matched_players if p["side"] == side]
-            if not candidates:
+    # ── Назначаем MVP: ОДИН на каждой стороне — тот у кого максимальная оценка ──
+    # Для каждого matched_player находим его ближайшую оценку из player_scores
+    for p in matched_players:
+        p_y = p["ocr_y"]
+        p_side = p["side"]
+        best_val = None
+        best_dist = 9999
+        for ps in player_scores:
+            if ps["side"] != p_side:
                 continue
-            # Ближайший по Y к значку MVP
-            closest = min(candidates, key=lambda p: abs(p["ocr_y"] - mvp_pos["center_y"]))
-            closest["is_mvp"] = True
-            print(f"[MVP Final] {closest['game_nickname']} — MVP по значку на стороне {side}")
+            dist = abs(ps["center_y"] - p_y)
+            if dist < best_dist:
+                best_dist = dist
+                best_val = ps["score_val"]
+        p["player_score"] = best_val if best_dist < 80 else None
 
-    # Метод 2 (резервный): если ни один не помечен на стороне — берём с макс оценкой
-    for side, score_info in max_score_by_side.items():
-        side_players = [p for p in matched_players if p["side"] == side]
+    # На каждой стороне — MVP тот, у кого player_score максимальный
+    for side in ("left", "right"):
+        side_players = [p for p in matched_players if p["side"] == side and p.get("player_score") is not None]
         if not side_players:
             continue
-        already_has_mvp = any(p["is_mvp"] for p in side_players)
-        if not already_has_mvp:
-            closest = min(side_players, key=lambda p: abs(p["ocr_y"] - score_info["center_y"]))
-            closest["is_mvp"] = True
-            print(f"[MVP Final Fallback] {closest['game_nickname']} — MVP по оценке {score_info['score_val']} на стороне {side}")
+        mvp_player = max(side_players, key=lambda p: p["player_score"])
+        mvp_player["is_mvp"] = True
+        print(f"[MVP Final] {mvp_player['game_nickname']} — MVP по оценке {mvp_player['player_score']} на стороне {side}")
 
     return {
         "matched": matched_players,
