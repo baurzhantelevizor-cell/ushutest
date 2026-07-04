@@ -83,7 +83,9 @@ async def init_db() -> asyncpg.Pool:
                 ready_channel_id  BIGINT,
                 voice_team1_id    BIGINT,
                 voice_team2_id    BIGINT,
-                host_role_id      BIGINT
+                host_role_id      BIGINT,
+                log_match_id      BIGINT,
+                log_admin_id      BIGINT
             );
             """
         )
@@ -93,6 +95,8 @@ async def init_db() -> asyncpg.Pool:
             await conn.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS voice_team1_id BIGINT;")
             await conn.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS voice_team2_id BIGINT;")
             await conn.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS host_role_id BIGINT;")
+            await conn.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS log_match_id BIGINT;")
+            await conn.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS log_admin_id BIGINT;")
         except Exception:
             pass
 
@@ -192,7 +196,9 @@ async def save_guild_setting(guild_id: int, key: str, value: int | None) -> None
             "ready_channel_id": None,
             "voice_team1_id": None,
             "voice_team2_id": None,
-            "host_role_id": None
+            "host_role_id": None,
+            "log_match_id": None,
+            "log_admin_id": None
         }
     guild_settings_cache[guild_id][key] = value
 
@@ -215,6 +221,12 @@ def get_guild_voice_team2(guild_id: int) -> int | None:
 
 def get_guild_host_role(guild_id: int) -> int | None:
     return guild_settings_cache.get(guild_id, {}).get("host_role_id")
+
+def get_guild_log_match(guild_id: int) -> int | None:
+    return guild_settings_cache.get(guild_id, {}).get("log_match_id")
+
+def get_guild_log_admin(guild_id: int) -> int | None:
+    return guild_settings_cache.get(guild_id, {}).get("log_admin_id")
 
 
 # Проверка: имеет ли пользователь права ведущего (ведущий, админ или роль ведущего)
@@ -1345,6 +1357,34 @@ async def cmd_set_host_role(interaction: discord.Interaction, role: discord.Role
     )
 
 
+# ───────────── /set_log_match ─────────────
+@bot.tree.command(
+    name="set_log_match",
+    description="[Админ] Назначить канал для логов результатов матчей (ЭЛО после матча)"
+)
+@app_commands.describe(channel="Текстовый канал для логов матчей")
+@app_commands.default_permissions(administrator=True)
+async def cmd_set_log_match(interaction: discord.Interaction, channel: discord.TextChannel):
+    await save_guild_setting(interaction.guild_id, "log_match_id", channel.id)
+    await interaction.response.send_message(
+        f"✅ Канал для логов матчей установлен: **{channel.name}** (`{channel.id}`)",
+        ephemeral=True
+    )
+
+# ───────────── /set_log_admin ─────────────
+@bot.tree.command(
+    name="set_log_admin",
+    description="[Админ] Назначить канал для логов админских действий (ручное изменение ЭЛО)"
+)
+@app_commands.describe(channel="Текстовый канал для логов админа")
+@app_commands.default_permissions(administrator=True)
+async def cmd_set_log_admin(interaction: discord.Interaction, channel: discord.TextChannel):
+    await save_guild_setting(interaction.guild_id, "log_admin_id", channel.id)
+    await interaction.response.send_message(
+        f"✅ Канал для админских логов установлен: **{channel.name}** (`{channel.id}`)",
+        ephemeral=True
+    )
+
 # ───────────── /settings ──────────────
 @bot.tree.command(
     name="settings",
@@ -1358,6 +1398,8 @@ async def cmd_settings(interaction: discord.Interaction):
     vt1_id = get_guild_voice_team1(guild_id)
     vt2_id = get_guild_voice_team2(guild_id)
     host_r_id = get_guild_host_role(guild_id)
+    lm_id = get_guild_log_match(guild_id)
+    la_id = get_guild_log_admin(guild_id)
 
     vc_text = f"<#{vc_id}>" if vc_id else "❌ _Не задан_ — используй `/set_voice`"
     rc_text = f"<#{rc_id}>" if rc_id else "❌ _Не задан_ — используй `/set_ready`"
@@ -1488,11 +1530,28 @@ async def cmd_set_elo(
         )
         return
 
+    old_elo = await get_elo(player.id)
     await set_elo_db(player.id, elo)
     await interaction.response.send_message(
         f"✅ ЭЛО игрока **{player.display_name}** установлено на **{elo}**.",
         ephemeral=True,
     )
+    # Отправляем лог
+    admin_log_id = get_guild_log_admin(interaction.guild_id)
+    if admin_log_id:
+        log_ch = interaction.guild.get_channel(admin_log_id)
+        if log_ch:
+            embed = discord.Embed(
+                title="🔧 Ручное изменение ЭЛО",
+                description=f"Администратор {interaction.user.mention} изменил ЭЛО игроку {player.mention}",
+                color=0xFEE75C
+            )
+            embed.add_field(name="Было", value=str(old_elo), inline=True)
+            embed.add_field(name="Стало", value=str(elo), inline=True)
+            try:
+                await log_ch.send(embed=embed)
+            except Exception:
+                pass
 
 
 # ───────────── /elo ───────────────────
