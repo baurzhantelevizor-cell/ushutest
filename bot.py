@@ -1407,6 +1407,9 @@ async def cmd_settings(interaction: discord.Interaction):
     vt2_text = f"<#{vt2_id}>" if vt2_id else "❌ _Не задан_ — используй `/set_voice_team2`"
     host_text = f"<@&{host_r_id}>" if host_r_id else "❌ _Не задана_ — используй `/set_host_role`"
 
+    lm_text = f"<#{lm_id}>" if lm_id else "❌ _Не задан_ — используй `/set_log_match`"
+    la_text = f"<#{la_id}>" if la_id else "❌ _Не задан_ — используй `/set_log_admin`"
+
     embed = discord.Embed(
         title="⚙️  Настройки бота",
         color=0x5865F2,
@@ -1416,6 +1419,8 @@ async def cmd_settings(interaction: discord.Interaction):
     embed.add_field(name="🔵 Войс для Команды 1", value=vt1_text, inline=True)
     embed.add_field(name="🔴 Войс для Команды 2", value=vt2_text, inline=True)
     embed.add_field(name="🎖️ Роль Ведущего матчей", value=host_text, inline=False)
+    embed.add_field(name="📋 Логи матчей", value=lm_text, inline=True)
+    embed.add_field(name="🔧 Логи админов", value=la_text, inline=True)
     embed.set_footer(text="Используйте команды настройки для изменения каналов")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
