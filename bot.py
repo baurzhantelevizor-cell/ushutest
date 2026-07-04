@@ -1634,8 +1634,12 @@ async def cmd_profile(interaction: discord.Interaction, player: discord.Member |
         rank_name = "🔮 Эпик"
     elif elo < 1200:
         rank_name = "👑 Легенда"
-    else:
+    elif elo < 1400:
+        rank_name = "🌟 Мифический"
+    elif elo < 1600:
         rank_name = "🌟 Мифическая Слава"
+    else:
+        rank_name = "🌟 Мифический Бессмертный"
 
     # 2. Читаем общую статистику из player_stats
     async with db_pool.acquire() as conn:
