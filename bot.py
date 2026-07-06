@@ -1596,6 +1596,43 @@ async def cmd_plus_elo(
                 pass
 
 
+# ───────────── /minus_elo ──────────────
+@bot.tree.command(name="minus_elo", description="[Админ] Отнять ЭЛО у игрока")
+@app_commands.describe(player="Игрок", amount="Сколько ЭЛО отнять (введите положительное число)")
+@app_commands.default_permissions(administrator=True)
+async def cmd_minus_elo(
+    interaction: discord.Interaction,
+    player: discord.Member,
+    amount: int,
+):
+    amount = abs(amount)  # На всякий случай берём модуль, чтобы пользователь мог ввести и 50, и -50
+    old_elo = await get_elo(player.id)
+    new_elo = max(0, old_elo - amount)  # Не даём ЭЛО упасть ниже нуля
+    await set_elo_db(player.id, new_elo)
+    
+    await interaction.response.send_message(
+        f"✅ У игрока **{player.display_name}** отнято **{amount}** ЭЛО. Теперь у него **{new_elo}** ЭЛО.",
+        ephemeral=True,
+    )
+    # Отправляем лог
+    admin_log_id = get_guild_log_admin(interaction.guild_id)
+    if admin_log_id:
+        log_ch = interaction.guild.get_channel(admin_log_id)
+        if log_ch:
+            embed = discord.Embed(
+                title="🔧 Ручное изменение ЭЛО (minus_elo)",
+                description=f"Администратор {interaction.user.mention} отнял ЭЛО у игрока {player.mention}",
+                color=0xFEE75C
+            )
+            embed.add_field(name="Было", value=str(old_elo), inline=True)
+            embed.add_field(name="Изменение", value=f"-{amount}", inline=True)
+            embed.add_field(name="Стало", value=str(new_elo), inline=True)
+            try:
+                await log_ch.send(embed=embed)
+            except Exception:
+                pass
+
+
 # ───────────── /elo ───────────────────
 @bot.tree.command(name="elo", description="Посмотреть свой текущий ЭЛО-рейтинг")
 async def cmd_elo(interaction: discord.Interaction):
