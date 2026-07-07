@@ -1520,6 +1520,37 @@ async def cmd_start_dalbaeb(interaction: discord.Interaction):
     await run_lobby_init(interaction, "chaos", "Хаос")
 
 
+async def send_admin_elo_log(
+    interaction: discord.Interaction,
+    player: discord.Member,
+    action_type: str,
+    old_elo: int,
+    new_elo: int,
+    change_str: str = None
+):
+    admin_log_id = get_guild_log_admin(interaction.guild_id)
+    if not admin_log_id:
+        return
+    log_ch = interaction.guild.get_channel(admin_log_id)
+    if not log_ch:
+        return
+
+    embed = discord.Embed(
+        title=f"🔧 Ручное изменение ЭЛО ({action_type})",
+        description=f"Администратор {interaction.user.mention} изменил ЭЛО игроку {player.mention}",
+        color=0xFEE75C
+    )
+    embed.add_field(name="Было", value=str(old_elo), inline=True)
+    if change_str:
+        embed.add_field(name="Изменение", value=change_str, inline=True)
+    embed.add_field(name="Стало", value=str(new_elo), inline=True)
+    
+    try:
+        await log_ch.send(embed=embed)
+    except Exception:
+        pass
+
+
 # ───────────── /set_elo ───────────────
 @bot.tree.command(name="set_elo", description="[Админ] Установить ЭЛО игроку")
 @app_commands.describe(player="Игрок", elo="Новое значение ЭЛО")
@@ -1542,21 +1573,7 @@ async def cmd_set_elo(
         ephemeral=True,
     )
     # Отправляем лог
-    admin_log_id = get_guild_log_admin(interaction.guild_id)
-    if admin_log_id:
-        log_ch = interaction.guild.get_channel(admin_log_id)
-        if log_ch:
-            embed = discord.Embed(
-                title="🔧 Ручное изменение ЭЛО",
-                description=f"Администратор {interaction.user.mention} изменил ЭЛО игроку {player.mention}",
-                color=0xFEE75C
-            )
-            embed.add_field(name="Было", value=str(old_elo), inline=True)
-            embed.add_field(name="Стало", value=str(elo), inline=True)
-            try:
-                await log_ch.send(embed=embed)
-            except Exception:
-                pass
+    await send_admin_elo_log(interaction, player, "set_elo", old_elo, elo)
 
 
 # ───────────── /plus_elo ───────────────
@@ -1578,22 +1595,7 @@ async def cmd_plus_elo(
         ephemeral=True,
     )
     # Отправляем лог
-    admin_log_id = get_guild_log_admin(interaction.guild_id)
-    if admin_log_id:
-        log_ch = interaction.guild.get_channel(admin_log_id)
-        if log_ch:
-            embed = discord.Embed(
-                title="🔧 Ручное изменение ЭЛО (plus_elo)",
-                description=f"Администратор {interaction.user.mention} {action_word} ЭЛО игроку {player.mention}",
-                color=0xFEE75C
-            )
-            embed.add_field(name="Было", value=str(old_elo), inline=True)
-            embed.add_field(name="Изменение", value=f"{amount:+d}", inline=True)
-            embed.add_field(name="Стало", value=str(new_elo), inline=True)
-            try:
-                await log_ch.send(embed=embed)
-            except Exception:
-                pass
+    await send_admin_elo_log(interaction, player, "plus_elo", old_elo, new_elo, f"{amount:+d}")
 
 
 # ───────────── /minus_elo ──────────────
@@ -1615,22 +1617,7 @@ async def cmd_minus_elo(
         ephemeral=True,
     )
     # Отправляем лог
-    admin_log_id = get_guild_log_admin(interaction.guild_id)
-    if admin_log_id:
-        log_ch = interaction.guild.get_channel(admin_log_id)
-        if log_ch:
-            embed = discord.Embed(
-                title="🔧 Ручное изменение ЭЛО (minus_elo)",
-                description=f"Администратор {interaction.user.mention} отнял ЭЛО у игрока {player.mention}",
-                color=0xFEE75C
-            )
-            embed.add_field(name="Было", value=str(old_elo), inline=True)
-            embed.add_field(name="Изменение", value=f"-{amount}", inline=True)
-            embed.add_field(name="Стало", value=str(new_elo), inline=True)
-            try:
-                await log_ch.send(embed=embed)
-            except Exception:
-                pass
+    await send_admin_elo_log(interaction, player, "minus_elo", old_elo, new_elo, f"-{amount}")
 
 
 # ───────────── /elo ───────────────────
