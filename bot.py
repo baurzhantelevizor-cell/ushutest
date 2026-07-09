@@ -1620,6 +1620,33 @@ async def cmd_minus_elo(
     await send_admin_elo_log(interaction, player, "minus_elo", old_elo, new_elo, f"-{amount}")
 
 
+# ───────────── /reset_all_elo ──────────
+@bot.tree.command(name="reset_all_elo", description="[Админ] Сбросить ЭЛО абсолютно ВСЕХ игроков до 300 (Новый сезон)")
+@app_commands.default_permissions(administrator=True)
+async def cmd_reset_all_elo(interaction: discord.Interaction):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE players SET elo = $1", DEFAULT_ELO)
+        
+    await interaction.response.send_message(
+        f"✅ **Успешно!** ЭЛО всех игроков в базе данных сброшено до **{DEFAULT_ELO}**.",
+        ephemeral=True
+    )
+    
+    admin_log_id = get_guild_log_admin(interaction.guild_id)
+    if admin_log_id:
+        log_ch = interaction.guild.get_channel(admin_log_id)
+        if log_ch:
+            embed = discord.Embed(
+                title="⚠️ МАШТАБНЫЙ СБРОС (reset_all_elo)",
+                description=f"Администратор {interaction.user.mention} сбросил рейтинг (ЭЛО) **абсолютно всех игроков** до {DEFAULT_ELO}!",
+                color=0xFF0000
+            )
+            try:
+                await log_ch.send(embed=embed)
+            except Exception:
+                pass
+
+
 # ───────────── /elo ───────────────────
 @bot.tree.command(name="elo", description="Посмотреть свой текущий ЭЛО-рейтинг")
 async def cmd_elo(interaction: discord.Interaction):
